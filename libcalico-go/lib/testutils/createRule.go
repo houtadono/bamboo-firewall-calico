@@ -1,4 +1,4 @@
-// Copyright (c) 2016 Tigera, Inc. All rights reserved.
+// Copyright (c) 2016-2024 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,6 +16,7 @@ package testutils
 
 import (
 	"log"
+	"math"
 	"net"
 	"strconv"
 
@@ -34,6 +35,9 @@ func CreateRule(ipv, icmpType, icmpCode int, proto, cidrStr, tag, selector, inAc
 	if err != nil {
 		protocol = numorstring.ProtocolFromString(proto)
 	} else {
+		if i > math.MaxUint8 || i < 0 {
+			log.Printf("i = %v should be between 0 and 255 \n", i)
+		}
 		protocol = numorstring.ProtocolFromInt(uint8(i))
 	}
 
@@ -50,7 +54,7 @@ func CreateRule(ipv, icmpType, icmpCode int, proto, cidrStr, tag, selector, inAc
 	src := api.EntityRule{
 		Tag: tag,
 		Net: &cnet.IPNet{
-			*cidr,
+			IPNet: *cidr,
 		},
 		Selector: selector,
 	}

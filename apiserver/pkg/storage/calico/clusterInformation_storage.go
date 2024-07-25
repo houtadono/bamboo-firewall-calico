@@ -5,11 +5,11 @@ package calico
 import (
 	"reflect"
 
-	"golang.org/x/net/context"
+	"context"
+
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apiserver/pkg/registry/generic/registry"
 	"k8s.io/apiserver/pkg/storage"
-	etcd "k8s.io/apiserver/pkg/storage/etcd3"
 	"k8s.io/apiserver/pkg/storage/storagebackend/factory"
 
 	api "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
@@ -39,7 +39,7 @@ func NewClusterInformationStorage(opts Options) (registry.DryRunnableStorage, fa
 	dryRunnableStorage := registry.DryRunnableStorage{Storage: &resourceStore{
 		client:            c,
 		codec:             opts.RESTOptions.StorageConfig.Codec,
-		versioner:         etcd.APIObjectVersioner{},
+		versioner:         APIObjectVersioner{},
 		aapiType:          reflect.TypeOf(aapi.ClusterInformation{}),
 		aapiListType:      reflect.TypeOf(aapi.ClusterInformationList{}),
 		libCalicoType:     reflect.TypeOf(api.ClusterInformation{}),

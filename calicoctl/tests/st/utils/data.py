@@ -77,6 +77,106 @@ ippool_name1_rev2_v4 = {
     }
 }
 
+ippool_name1_rev3_v4 = {
+    'apiVersion': API_VERSION,
+    'kind': 'IPPool',
+    'metadata': {
+        'name': 'ippool-name1'
+    },
+    'spec': {
+        'cidr': "10.0.1.0/24",
+        'ipipMode': 'Always',
+        'vxlanMode': 'Never',
+        'blockSize': 27,
+        'allowedUses': ["Workload", "Tunnel"],
+        'nodeSelector': "foo == 'bar'",
+        'disabled': True,
+    }
+}
+
+ippool_name1_rev4_v4 = {
+    'apiVersion': API_VERSION,
+    'kind': 'IPPool',
+    'metadata': {
+        'name': 'ippool-name1',
+        'labels': {'test-label': 'label-1'},
+        'annotations': {'test-annotation': 'annotation-1'},
+    },
+    'spec': {
+        'cidr': "10.0.1.0/24",
+        'ipipMode': 'Always',
+        'vxlanMode': 'Never',
+        'blockSize': 27,
+        'allowedUses': ["Workload", "Tunnel"],
+        'nodeSelector': "foo == 'bar'",
+        'disabled': True,
+    }
+}
+
+ippool_name1_rev1_split1_v4 = {
+    'apiVersion': API_VERSION,
+    'kind': 'IPPool',
+    'metadata': {
+        'name': 'split-ippool-name1-0'
+    },
+    'spec': {
+        'cidr': "10.0.1.0/26",
+        'ipipMode': 'Always',
+        'vxlanMode': 'Never',
+        'blockSize': 27,
+        'allowedUses': ["Workload", "Tunnel"],
+        'nodeSelector': "foo == 'bar'",
+    }
+}
+
+ippool_name1_rev1_split2_v4 = {
+    'apiVersion': API_VERSION,
+    'kind': 'IPPool',
+    'metadata': {
+        'name': 'split-ippool-name1-1'
+    },
+    'spec': {
+        'cidr': "10.0.1.64/26",
+        'ipipMode': 'Always',
+        'vxlanMode': 'Never',
+        'blockSize': 27,
+        'allowedUses': ["Workload", "Tunnel"],
+        'nodeSelector': "foo == 'bar'",
+    }
+}
+
+ippool_name1_rev1_split3_v4 = {
+    'apiVersion': API_VERSION,
+    'kind': 'IPPool',
+    'metadata': {
+        'name': 'split-ippool-name1-2'
+    },
+    'spec': {
+        'cidr': "10.0.1.128/26",
+        'ipipMode': 'Always',
+        'vxlanMode': 'Never',
+        'blockSize': 27,
+        'allowedUses': ["Workload", "Tunnel"],
+        'nodeSelector': "foo == 'bar'",
+    }
+}
+
+ippool_name1_rev1_split4_v4 = {
+    'apiVersion': API_VERSION,
+    'kind': 'IPPool',
+    'metadata': {
+        'name': 'split-ippool-name1-3'
+    },
+    'spec': {
+        'cidr': "10.0.1.192/26",
+        'ipipMode': 'Always',
+        'vxlanMode': 'Never',
+        'blockSize': 27,
+        'allowedUses': ["Workload", "Tunnel"],
+        'nodeSelector': "foo == 'bar'",
+    }
+}
+
 ippool_name2_rev1_v6 = {
     'apiVersion': API_VERSION,
     'kind': 'IPPool',
@@ -123,6 +223,28 @@ ipresv_name1_rev1_v4_long = {
         'reservedCIDRs': many_nets,
     }
 }
+
+#
+# BGP filters
+#
+
+bgpfilter_name1_rev1 = {
+    'apiVersion': API_VERSION,
+    'kind': 'BGPFilter',
+    'metadata': {
+        'name': 'bgpfilter-name1'
+    },
+    'spec': {
+        'exportv4': [
+            {
+                'cidr': '10.0.0.0/16',
+                'matchOperator': 'Equal',
+                'action': 'Accept',
+            },
+        ],
+    }
+}
+
 
 #
 # BGPPeers
@@ -294,7 +416,6 @@ networkpolicy_name2_rev1 = {
             'name': 'endpoint1',
             'uid': 'test-uid-change',
         }],
-        'clusterName': 'cluster1',
         'labels': {'label1': 'l1', 'label2': 'l2'},
         'annotations': {'key': 'value'},
         'selfLink': 'test-self-link',

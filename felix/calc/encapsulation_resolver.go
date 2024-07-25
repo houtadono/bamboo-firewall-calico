@@ -16,8 +16,9 @@ package calc
 
 import (
 	"fmt"
+	"net"
 
-	log "github.com/sirupsen/logrus"
+	"github.com/sirupsen/logrus"
 
 	"github.com/projectcalico/calico/felix/config"
 	"github.com/projectcalico/calico/felix/dispatcher"
@@ -54,11 +55,11 @@ func (r *EncapsulationResolver) RegisterWith(dispatcher *dispatcher.Dispatcher) 
 }
 
 func (r *EncapsulationResolver) OnPoolUpdate(update api.Update) (filterOut bool) {
-	log.WithField("update", update).Debug("EncapsulationResolver: OnPoolUpdate")
+	logrus.WithField("update", update).Debug("EncapsulationResolver: OnPoolUpdate")
 
 	err := r.encapCalc.handlePool(update.KVPair)
 	if err != nil {
-		log.Infof("error handling update %+v: %v. Ignoring.", update, err)
+		logrus.Infof("error handling update %+v: %v. Ignoring.", update, err)
 		return
 	}
 
@@ -68,7 +69,7 @@ func (r *EncapsulationResolver) OnPoolUpdate(update api.Update) (filterOut bool)
 }
 
 func (r *EncapsulationResolver) OnStatusUpdate(status api.SyncStatus) {
-	log.WithField("status", status).Debug("EncapsulationResolver: SyncStatus update")
+	logrus.WithField("status", status).Debug("EncapsulationResolver: SyncStatus update")
 
 	if !r.inSync && status == api.InSync {
 		r.inSync = true
@@ -79,21 +80,26 @@ func (r *EncapsulationResolver) OnStatusUpdate(status api.SyncStatus) {
 func (r *EncapsulationResolver) triggerCalculation() {
 	if !r.inSync {
 		// Do nothing if EncapsulationResolver hasn't sync'ed all updates yet
-		log.Debug("EncapsulationResolver: skip calculation because inSync is false")
+		logrus.Debug("EncapsulationResolver: skip calculation because inSync is false")
 		return
 	}
 
 	newEncap := config.Encapsulation{
-		IPIPEnabled:  r.encapCalc.IPIPEnabled(),
-		VXLANEnabled: r.encapCalc.VXLANEnabled(),
+		IPIPEnabled:    r.encapCalc.IPIPEnabled(),
+		VXLANEnabled:   r.encapCalc.VXLANEnabled(),
+		VXLANEnabledV6: r.encapCalc.VXLANEnabledV6(),
 	}
 
-	if r.config.Encapsulation.IPIPEnabled != newEncap.IPIPEnabled || r.config.Encapsulation.VXLANEnabled != newEncap.VXLANEnabled {
-		log.WithFields(log.Fields{
-			"oldIPIPEnabled":  r.config.Encapsulation.IPIPEnabled,
-			"newIPIPEnabled":  newEncap.IPIPEnabled,
-			"oldVXLANEnabled": r.config.Encapsulation.VXLANEnabled,
-			"newVXLANEnabled": newEncap.VXLANEnabled,
+	if r.config.Encapsulation.IPIPEnabled != newEncap.IPIPEnabled ||
+		r.config.Encapsulation.VXLANEnabled != newEncap.VXLANEnabled ||
+		r.config.Encapsulation.VXLANEnabledV6 != newEncap.VXLANEnabledV6 {
+		logrus.WithFields(logrus.Fields{
+			"oldIPIPEnabled":    r.config.Encapsulation.IPIPEnabled,
+			"newIPIPEnabled":    newEncap.IPIPEnabled,
+			"oldVXLANEnabled":   r.config.Encapsulation.VXLANEnabled,
+			"newVXLANEnabled":   newEncap.VXLANEnabled,
+			"oldVXLANEnabledV6": r.config.Encapsulation.VXLANEnabledV6,
+			"newVXLANEnabledV6": newEncap.VXLANEnabledV6,
 		}).Info("EncapsulationResolver: Encapsulation changed.")
 	}
 
@@ -106,20 +112,22 @@ func (r *EncapsulationResolver) triggerCalculation() {
 // encapsulation changes to restart Felix, and by Run() in daemon.go, where it calculates
 // the encapsulation state that will be effectively used by Felix.
 type EncapsulationCalculator struct {
-	config     *config.Config
-	ipipPools  map[string]struct{}
-	vxlanPools map[string]struct{}
+	config       *config.Config
+	ipipPools    map[string]struct{}
+	vxlanPools   map[string]struct{}
+	vxlanPoolsv6 map[string]struct{}
 }
 
 func NewEncapsulationCalculator(config *config.Config, ippoolKVPList *model.KVPairList) *EncapsulationCalculator {
 	if config == nil {
-		log.Panic("Starting EncapsulationResolver with config==nil.")
+		logrus.Panic("Starting EncapsulationResolver with config==nil.")
 	}
 
 	encapCalc := &EncapsulationCalculator{
-		config:     config,
-		ipipPools:  map[string]struct{}{},
-		vxlanPools: map[string]struct{}{},
+		config:       config,
+		ipipPools:    map[string]struct{}{},
+		vxlanPools:   map[string]struct{}{},
+		vxlanPoolsv6: map[string]struct{}{},
 	}
 
 	if ippoolKVPList != nil {
@@ -133,7 +141,7 @@ func (c *EncapsulationCalculator) initPools(ippoolKVPList *model.KVPairList) {
 	for _, kvp := range ippoolKVPList.KVPairs {
 		err := c.handlePool(*kvp)
 		if err != nil {
-			log.Infof("error handling update %+v: %v. Ignoring.", *kvp, err)
+			logrus.Infof("error handling update %+v: %v. Ignoring.", *kvp, err)
 		}
 	}
 }
@@ -188,6 +196,24 @@ func (c *EncapsulationCalculator) handleAPIPool(p model.KVPair) error {
 		return fmt.Errorf("failed to convert %+v to *model.IPPool", p.Value)
 	}
 
+	// Validate pool's IPIPMode
+	switch pool.Spec.IPIPMode {
+	case apiv3.IPIPModeNever:
+	case apiv3.IPIPModeAlways:
+	case apiv3.IPIPModeCrossSubnet:
+	default:
+		return fmt.Errorf("invalid IPIPMode \"%v\" for %v", pool.Spec.IPIPMode, pool.Spec.CIDR)
+	}
+
+	// Validate pool's VXLANMode
+	switch pool.Spec.VXLANMode {
+	case apiv3.VXLANModeNever:
+	case apiv3.VXLANModeAlways:
+	case apiv3.VXLANModeCrossSubnet:
+	default:
+		return fmt.Errorf("invalid VXLANMode \"%v\" for %v", pool.Spec.VXLANMode, pool.Spec.CIDR)
+	}
+
 	poolKey := pool.Spec.CIDR
 	c.updatePool(poolKey, pool.Spec.IPIPMode != apiv3.IPIPModeNever, pool.Spec.VXLANMode != apiv3.VXLANModeNever)
 
@@ -202,15 +228,25 @@ func (c *EncapsulationCalculator) updatePool(cidr string, ipipEnabled, vxlanEnab
 	}
 
 	if vxlanEnabled {
-		c.vxlanPools[cidr] = struct{}{}
+		parsed, _, err := net.ParseCIDR(cidr)
+		if err != nil {
+			logrus.WithError(err).Fatal("Invalid CIDR")
+		}
+		if parsed.To4() != nil {
+			c.vxlanPools[cidr] = struct{}{}
+		} else {
+			c.vxlanPoolsv6[cidr] = struct{}{}
+		}
 	} else {
 		delete(c.vxlanPools, cidr)
+		delete(c.vxlanPoolsv6, cidr)
 	}
 }
 
 func (c *EncapsulationCalculator) removePool(cidr string) {
 	delete(c.ipipPools, cidr)
 	delete(c.vxlanPools, cidr)
+	delete(c.vxlanPoolsv6, cidr)
 }
 
 func (c *EncapsulationCalculator) IPIPEnabled() bool {
@@ -227,4 +263,8 @@ func (c *EncapsulationCalculator) VXLANEnabled() bool {
 	}
 
 	return len(c.vxlanPools) > 0
+}
+
+func (c *EncapsulationCalculator) VXLANEnabledV6() bool {
+	return len(c.vxlanPoolsv6) > 0
 }

@@ -1,4 +1,4 @@
-// Copyright (c) 2016-2021 Tigera, Inc. All rights reserved.
+// Copyright (c) 2016-2023 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -21,30 +21,31 @@ import (
 
 	"github.com/projectcalico/calico/libcalico-go/lib/set"
 
-	"github.com/projectcalico/calico/felix/iptables"
+	"github.com/projectcalico/calico/felix/generictables"
 	"github.com/projectcalico/calico/felix/proto"
 	"github.com/projectcalico/calico/felix/rules"
 )
 
-// policyManager simply renders policy/profile updates into iptables.Chain objects and sends
+// policyManager simply renders policy/profile updates into generictables.Chain objects and sends
 // them to the dataplane layer.
 type policyManager struct {
-	rawTable       iptablesTable
-	mangleTable    iptablesTable
-	filterTable    iptablesTable
-	ruleRenderer   policyRenderer
-	ipVersion      uint8
-	rawEgressOnly  bool
-	neededIPSets   map[proto.PolicyID]set.Set
-	ipSetsCallback func(neededIPSets set.Set)
+	rawTable         Table
+	mangleTable      Table
+	filterTable      Table
+	ruleRenderer     policyRenderer
+	ipVersion        uint8
+	rawEgressOnly    bool
+	ipSetFilterDirty bool // Only used in "raw only" mode.
+	neededIPSets     map[proto.PolicyID]set.Set[string]
+	ipSetsCallback   func(neededIPSets set.Set[string])
 }
 
 type policyRenderer interface {
-	PolicyToIptablesChains(policyID *proto.PolicyID, policy *proto.Policy, ipVersion uint8) []*iptables.Chain
-	ProfileToIptablesChains(profileID *proto.ProfileID, policy *proto.Profile, ipVersion uint8) (inbound, outbound *iptables.Chain)
+	PolicyToIptablesChains(policyID *proto.PolicyID, policy *proto.Policy, ipVersion uint8) []*generictables.Chain
+	ProfileToIptablesChains(profileID *proto.ProfileID, policy *proto.Profile, ipVersion uint8) (inbound, outbound *generictables.Chain)
 }
 
-func newPolicyManager(rawTable, mangleTable, filterTable iptablesTable, ruleRenderer policyRenderer, ipVersion uint8) *policyManager {
+func newPolicyManager(rawTable, mangleTable, filterTable Table, ruleRenderer policyRenderer, ipVersion uint8) *policyManager {
 	return &policyManager{
 		rawTable:     rawTable,
 		mangleTable:  mangleTable,
@@ -54,47 +55,36 @@ func newPolicyManager(rawTable, mangleTable, filterTable iptablesTable, ruleRend
 	}
 }
 
-func newRawEgressPolicyManager(rawTable iptablesTable, ruleRenderer policyRenderer, ipVersion uint8, ipSetsCallback func(neededIPSets set.Set)) *policyManager {
+func newRawEgressPolicyManager(rawTable Table, ruleRenderer policyRenderer, ipVersion uint8,
+	ipSetsCallback func(neededIPSets set.Set[string]),
+) *policyManager {
 	return &policyManager{
-		rawTable:       rawTable,
-		mangleTable:    &noopTable{},
-		filterTable:    &noopTable{},
-		ruleRenderer:   ruleRenderer,
-		ipVersion:      ipVersion,
-		rawEgressOnly:  true,
-		neededIPSets:   make(map[proto.PolicyID]set.Set),
-		ipSetsCallback: ipSetsCallback,
+		rawTable:      rawTable,
+		mangleTable:   generictables.NewNoopTable(),
+		filterTable:   generictables.NewNoopTable(),
+		ruleRenderer:  ruleRenderer,
+		ipVersion:     ipVersion,
+		rawEgressOnly: true,
+		// Make sure we set the filter at start-of-day, even if there are no policies.
+		ipSetFilterDirty: true,
+		neededIPSets:     make(map[proto.PolicyID]set.Set[string]),
+		ipSetsCallback:   ipSetsCallback,
 	}
-}
-
-func (m *policyManager) mergeNeededIPSets(id *proto.PolicyID, neededIPSets set.Set) {
-	if neededIPSets != nil {
-		m.neededIPSets[*id] = neededIPSets
-	} else {
-		delete(m.neededIPSets, *id)
-	}
-	merged := set.New()
-	for _, ipSets := range m.neededIPSets {
-		ipSets.Iter(func(item interface{}) error {
-			merged.Add(item)
-			return nil
-		})
-	}
-	m.ipSetsCallback(merged)
 }
 
 func (m *policyManager) OnUpdate(msg interface{}) {
 	switch msg := msg.(type) {
 	case *proto.ActivePolicyUpdate:
 		if m.rawEgressOnly && !msg.Policy.Untracked {
-			log.WithField("id", msg.Id).Debug("Ignore non-untracked policy")
+			log.WithField("id", msg.Id).Debug("Clean up non-untracked policy.")
+			m.cleanUpPolicy(msg.Id)
 			return
 		}
 		log.WithField("id", msg.Id).Debug("Updating policy chains")
 		chains := m.ruleRenderer.PolicyToIptablesChains(msg.Id, msg.Policy, m.ipVersion)
 		if m.rawEgressOnly {
-			neededIPSets := set.New()
-			filteredChains := []*iptables.Chain(nil)
+			neededIPSets := set.New[string]()
+			filteredChains := []*generictables.Chain(nil)
 			for _, chain := range chains {
 				if strings.Contains(chain.Name, string(rules.PolicyOutboundPfx)) {
 					filteredChains = append(filteredChains, chain)
@@ -102,7 +92,7 @@ func (m *policyManager) OnUpdate(msg interface{}) {
 				}
 			}
 			chains = filteredChains
-			m.mergeNeededIPSets(msg.Id, neededIPSets)
+			m.updateNeededIPSets(msg.Id, neededIPSets)
 		}
 		// We can't easily tell whether the policy is in use in a particular table, and, if the policy
 		// type gets changed it may move between tables.  Hence, we put the policy into all tables.
@@ -112,18 +102,7 @@ func (m *policyManager) OnUpdate(msg interface{}) {
 		m.filterTable.UpdateChains(chains)
 	case *proto.ActivePolicyRemove:
 		log.WithField("id", msg.Id).Debug("Removing policy chains")
-		if m.rawEgressOnly {
-			m.mergeNeededIPSets(msg.Id, nil)
-		}
-		inName := rules.PolicyChainName(rules.PolicyInboundPfx, msg.Id)
-		outName := rules.PolicyChainName(rules.PolicyOutboundPfx, msg.Id)
-		// As above, we need to clean up in all the tables.
-		m.filterTable.RemoveChainByName(inName)
-		m.filterTable.RemoveChainByName(outName)
-		m.mangleTable.RemoveChainByName(inName)
-		m.mangleTable.RemoveChainByName(outName)
-		m.rawTable.RemoveChainByName(inName)
-		m.rawTable.RemoveChainByName(outName)
+		m.cleanUpPolicy(msg.Id)
 	case *proto.ActiveProfileUpdate:
 		if m.rawEgressOnly {
 			log.WithField("id", msg.Id).Debug("Ignore non-untracked profile")
@@ -131,8 +110,8 @@ func (m *policyManager) OnUpdate(msg interface{}) {
 		}
 		log.WithField("id", msg.Id).Debug("Updating profile chains")
 		inbound, outbound := m.ruleRenderer.ProfileToIptablesChains(msg.Id, msg.Profile, m.ipVersion)
-		m.filterTable.UpdateChains([]*iptables.Chain{inbound, outbound})
-		m.mangleTable.UpdateChains([]*iptables.Chain{outbound})
+		m.filterTable.UpdateChains([]*generictables.Chain{inbound, outbound})
+		m.mangleTable.UpdateChains([]*generictables.Chain{outbound})
 	case *proto.ActiveProfileRemove:
 		log.WithField("id", msg.Id).Debug("Removing profile chains")
 		inName := rules.ProfileChainName(rules.ProfileInboundPfx, msg.Id)
@@ -143,15 +122,46 @@ func (m *policyManager) OnUpdate(msg interface{}) {
 	}
 }
 
-func (m *policyManager) CompleteDeferredWork() error {
-	// Nothing to do, we don't defer any work.
-	return nil
+func (m *policyManager) cleanUpPolicy(id *proto.PolicyID) {
+	if m.rawEgressOnly {
+		m.updateNeededIPSets(id, nil)
+	}
+	inName := rules.PolicyChainName(rules.PolicyInboundPfx, id)
+	outName := rules.PolicyChainName(rules.PolicyOutboundPfx, id)
+	// As above, we need to clean up in all the tables.
+	m.filterTable.RemoveChainByName(inName)
+	m.filterTable.RemoveChainByName(outName)
+	m.mangleTable.RemoveChainByName(inName)
+	m.mangleTable.RemoveChainByName(outName)
+	m.rawTable.RemoveChainByName(inName)
+	m.rawTable.RemoveChainByName(outName)
 }
 
-// noopTable fulfils the iptablesTable interface but does nothing.
-type noopTable struct{}
+func (m *policyManager) updateNeededIPSets(id *proto.PolicyID, neededIPSets set.Set[string]) {
+	if neededIPSets != nil {
+		m.neededIPSets[*id] = neededIPSets
+	} else {
+		delete(m.neededIPSets, *id)
+	}
+	m.ipSetFilterDirty = true
+}
 
-func (t *noopTable) UpdateChain(chain *iptables.Chain) {}
-func (t *noopTable) UpdateChains([]*iptables.Chain)    {}
-func (t *noopTable) RemoveChains([]*iptables.Chain)    {}
-func (t *noopTable) RemoveChainByName(name string)     {}
+func (m *policyManager) CompleteDeferredWork() error {
+	if !m.rawEgressOnly {
+		return nil
+	}
+	if !m.ipSetFilterDirty {
+		return nil
+	}
+	m.ipSetFilterDirty = false
+
+	merged := set.New[string]()
+	for _, ipSets := range m.neededIPSets {
+		ipSets.Iter(func(item string) error {
+			merged.Add(item)
+			return nil
+		})
+	}
+	m.ipSetsCallback(merged)
+	return nil
+}

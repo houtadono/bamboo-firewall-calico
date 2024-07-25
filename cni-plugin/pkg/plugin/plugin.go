@@ -1,16 +1,17 @@
-// Copyright (c) 2015-2021 Tigera, Inc. All rights reserved.
+// Copyright (c) 2015-2024 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
+//	http://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+
 package plugin
 
 import (
@@ -19,11 +20,12 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"net/url"
 	"os"
 	"runtime"
+	"runtime/debug"
 	"time"
 
 	"github.com/containernetworking/cni/pkg/skel"
@@ -32,13 +34,11 @@ import (
 	cniSpecVersion "github.com/containernetworking/cni/pkg/version"
 	"github.com/containernetworking/plugins/pkg/ipam"
 	"github.com/mcuadros/go-version"
+	api "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 	"github.com/sirupsen/logrus"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/tools/clientcmd"
-
-	api "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 
 	"github.com/projectcalico/calico/cni-plugin/internal/pkg/utils"
 	"github.com/projectcalico/calico/cni-plugin/pkg/dataplane"
@@ -49,6 +49,7 @@ import (
 	cerrors "github.com/projectcalico/calico/libcalico-go/lib/errors"
 	"github.com/projectcalico/calico/libcalico-go/lib/logutils"
 	"github.com/projectcalico/calico/libcalico-go/lib/options"
+	"github.com/projectcalico/calico/libcalico-go/lib/winutils"
 )
 
 const testConnectionTimeout = 2 * time.Second
@@ -63,7 +64,7 @@ func init() {
 func testConnection() error {
 	// Unmarshal the network config
 	conf := types.NetConf{}
-	data, err := ioutil.ReadAll(os.Stdin)
+	data, err := io.ReadAll(os.Stdin)
 	if err != nil {
 		return errors.New("failed to read from stdin")
 	}
@@ -89,7 +90,7 @@ func testConnection() error {
 
 	// If we have a kubeconfig, test connection to the APIServer
 	if conf.Kubernetes.Kubeconfig != "" {
-		k8sconfig, err := clientcmd.BuildConfigFromFlags("", conf.Kubernetes.Kubeconfig)
+		k8sconfig, err := winutils.BuildConfigFromFlags("", conf.Kubernetes.Kubeconfig)
 		if err != nil {
 			return fmt.Errorf("error building K8s client config: %s", err)
 		}
@@ -123,14 +124,14 @@ func isEndpointReady(readyEndpoint string, timeout time.Duration) (bool, error) 
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 400 {
-		return false, fmt.Errorf("Endpoint is not ready, response code returned:%d", resp.StatusCode)
+		return false, fmt.Errorf("endpoint is not ready, response code returned:%d", resp.StatusCode)
 	}
 	return true, nil
 }
 
 func pollEndpointReadiness(endpoint string, interval, timeout time.Duration) error {
-	return wait.Poll(interval, timeout,
-		func() (bool, error) {
+	return wait.PollUntilContextTimeout(context.Background(), interval, timeout, false,
+		func(context.Context) (bool, error) {
 			if isReady, err := isEndpointReady(endpoint, interval); !isReady {
 				if err != nil {
 					logrus.Errorf("Endpoint may not be ready:%v", err)
@@ -148,7 +149,7 @@ func cmdAdd(args *skel.CmdArgs) (err error) {
 	// a proper error to the runtime.
 	defer func() {
 		if e := recover(); e != nil {
-			msg := fmt.Sprintf("Calico CNI panicked during ADD: %s", e)
+			msg := fmt.Sprintf("Calico CNI panicked during ADD: %s\nStack trace:\n%s", e, string(debug.Stack()))
 			if err != nil {
 				// If we're recovering and there was also an error, then we need to
 				// present both.
@@ -235,7 +236,7 @@ func cmdAdd(args *skel.CmdArgs) (err error) {
 
 	for _, endpoint := range conf.ReadinessGates {
 		if _, err := url.ParseRequestURI(endpoint); err != nil {
-			return fmt.Errorf("Invalid URL set for ReadinessGates:%s Error:%v",
+			return fmt.Errorf("invalid URL set for ReadinessGates:%s Error:%v",
 				endpoint, err)
 		}
 		err := pollEndpointReadiness(endpoint, 5*time.Second, 30*time.Second)
@@ -461,7 +462,7 @@ func cmdAdd(args *skel.CmdArgs) (err error) {
 
 			// Select the first 11 characters of the containerID for the host veth.
 			var hostVethName, contVethMac string
-			desiredVethName := "cali" + args.ContainerID[:utils.Min(11, len(args.ContainerID))]
+			desiredVethName := "cali" + args.ContainerID[:min(11, len(args.ContainerID))]
 			hostVethName, contVethMac, err = d.DoNetworking(
 				ctx, calicoClient, args, result, desiredVethName, utils.DefaultRoutes, endpoint, map[string]string{})
 			if err != nil {
@@ -565,7 +566,7 @@ func cmdDel(args *skel.CmdArgs) (err error) {
 	// a proper error to the runtime.
 	defer func() {
 		if e := recover(); e != nil {
-			msg := fmt.Sprintf("Calico CNI panicked during DEL: %s", e)
+			msg := fmt.Sprintf("Calico CNI panicked during DEL: %s\nStack trace:\n%s", e, string(debug.Stack()))
 			if err != nil {
 				// If we're recovering and there was also an error, then we need to
 				// present both.
@@ -689,10 +690,7 @@ func cmdDummyCheck(args *skel.CmdArgs) (err error) {
 
 func Main(version string) {
 	// Set up logging formatting.
-	logrus.SetFormatter(&logutils.Formatter{})
-
-	// Install a hook that adds file/line no information.
-	logrus.AddHook(&logutils.ContextHook{})
+	logutils.ConfigureFormatter("cni-plugin")
 
 	// Use a new flag set so as not to conflict with existing libraries which use "flag"
 	flagSet := flag.NewFlagSet("Calico", flag.ExitOnError)
@@ -747,7 +745,12 @@ func Main(version string) {
 		os.Exit(1)
 	}
 
-	skel.PluginMain(cmdAdd, cmdDummyCheck, cmdDel,
+	funcs := skel.CNIFuncs{
+		Add:   cmdAdd,
+		Del:   cmdDel,
+		Check: cmdDummyCheck,
+	}
+	skel.PluginMainFuncs(funcs,
 		cniSpecVersion.PluginSupports("0.1.0", "0.2.0", "0.3.0", "0.3.1", "0.4.0", "1.0.0"),
 		"Calico CNI plugin "+version)
 }

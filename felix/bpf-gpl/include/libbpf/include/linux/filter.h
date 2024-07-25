@@ -13,6 +13,14 @@
 		.off = OFF,					\
 		.imm = IMM })
 
+#define BPF_ALU32_IMM(OP, DST, IMM)				\
+	((struct bpf_insn) {					\
+		.code  = BPF_ALU | BPF_OP(OP) | BPF_K,		\
+		.dst_reg = DST,					\
+		.src_reg = 0,					\
+		.off   = 0,					\
+		.imm   = IMM })
+
 #define BPF_ALU64_IMM(OP, DST, IMM)				\
 	((struct bpf_insn) {					\
 		.code  = BPF_ALU64 | BPF_OP(OP) | BPF_K,	\
@@ -28,6 +36,14 @@
 		.src_reg = 0,					\
 		.off   = 0,					\
 		.imm   = IMM })
+
+#define BPF_CALL_REL(DST)					\
+	((struct bpf_insn) {					\
+		.code = BPF_JMP | BPF_CALL,			\
+		.dst_reg = 0,					\
+		.src_reg = BPF_PSEUDO_CALL,			\
+		.off = 0,					\
+		.imm = DST })
 
 #define BPF_EXIT_INSN()						\
 	((struct bpf_insn) {					\

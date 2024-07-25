@@ -1,4 +1,4 @@
-// Copyright (c) 2020-2021 Tigera, Inc. All rights reserved.
+// Copyright (c) 2020-2023 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -24,8 +24,10 @@ import (
 	"github.com/projectcalico/api/pkg/lib/numorstring"
 
 	"github.com/projectcalico/calico/felix/config"
+	"github.com/projectcalico/calico/felix/generictables"
 	"github.com/projectcalico/calico/felix/ipsets"
 	"github.com/projectcalico/calico/felix/iptables"
+	"github.com/projectcalico/calico/felix/nftables"
 	"github.com/projectcalico/calico/felix/proto"
 )
 
@@ -34,9 +36,10 @@ const (
 	// the end to reduce clashes with other apps.  Our OpenStack DHCP agent uses prefix
 	// 'calico-dhcp-', for example.
 	ChainNamePrefix = "cali-"
+
 	// IPSetNamePrefix: similarly for IP sets, we use the following prefix; the IP sets layer
 	// adds its own "-" so it isn't included here.
-	IPSetNamePrefix = "cali"
+	IPSetNamePrefix = ipsets.IPSetNamePrefix
 
 	ChainFilterInput   = ChainNamePrefix + "INPUT"
 	ChainFilterForward = ChainNamePrefix + "FORWARD"
@@ -74,6 +77,9 @@ const (
 	PolicyOutboundPfx  PolicyChainNamePrefix  = ChainNamePrefix + "po-"
 	ProfileInboundPfx  ProfileChainNamePrefix = ChainNamePrefix + "pri-"
 	ProfileOutboundPfx ProfileChainNamePrefix = ChainNamePrefix + "pro-"
+
+	PolicyGroupInboundPrefix  string = ChainNamePrefix + "gi-"
+	PolicyGroupOutboundPrefix string = ChainNamePrefix + "go-"
 
 	ChainWorkloadToHost       = ChainNamePrefix + "wl-to-host"
 	ChainFromWorkloadDispatch = ChainNamePrefix + "from-wl-dispatch"
@@ -123,9 +129,18 @@ const (
 	KubeProxyInsertRuleRegex = `-j KUBE-[a-zA-Z0-9-]*SERVICES|-j KUBE-FORWARD`
 )
 
+type PolicyDirection string
+
+const (
+	PolicyDirectionInbound  PolicyDirection = "inbound"  // AKA ingress
+	PolicyDirectionOutbound PolicyDirection = "outbound" // AKA egress
+)
+
 // Typedefs to prevent accidentally passing the wrong prefix to the Policy/ProfileChainName()
-type PolicyChainNamePrefix string
-type ProfileChainNamePrefix string
+type (
+	PolicyChainNamePrefix  string
+	ProfileChainNamePrefix string
+)
 
 var (
 	// AllHistoricChainNamePrefixes lists all the prefixes that we've used for chains.  Keeping
@@ -169,83 +184,97 @@ var (
 )
 
 type RuleRenderer interface {
-	StaticFilterTableChains(ipVersion uint8) []*iptables.Chain
-	StaticNATTableChains(ipVersion uint8) []*iptables.Chain
-	StaticNATPostroutingChains(ipVersion uint8) []*iptables.Chain
-	StaticRawTableChains(ipVersion uint8) []*iptables.Chain
-	StaticBPFModeRawChains(ipVersion uint8, wgEncryptHost, disableConntrack, enforceRPF bool) []*iptables.Chain
-	StaticMangleTableChains(ipVersion uint8) []*iptables.Chain
-	StaticFilterForwardAppendRules() []iptables.Rule
+	StaticFilterTableChains(ipVersion uint8) []*generictables.Chain
+	StaticNATTableChains(ipVersion uint8) []*generictables.Chain
+	StaticNATPostroutingChains(ipVersion uint8) []*generictables.Chain
+	StaticRawTableChains(ipVersion uint8) []*generictables.Chain
+	StaticBPFModeRawChains(ipVersion uint8, wgEncryptHost, disableConntrack bool) []*generictables.Chain
+	StaticMangleTableChains(ipVersion uint8) []*generictables.Chain
+	StaticFilterForwardAppendRules() []generictables.Rule
 
-	WorkloadDispatchChains(map[proto.WorkloadEndpointID]*proto.WorkloadEndpoint) []*iptables.Chain
-	WorkloadEndpointToIptablesChains(
-		ifaceName string,
-		epMarkMapper EndpointMarkMapper,
-		adminUp bool,
-		ingressPolicies []string,
-		egressPolicies []string,
-		profileIDs []string,
-	) []*iptables.Chain
+	WorkloadDispatchChains(map[proto.WorkloadEndpointID]*proto.WorkloadEndpoint) []*generictables.Chain
+	WorkloadEndpointToIptablesChains(ifaceName string, epMarkMapper EndpointMarkMapper, adminUp bool, ingressPolicies []*PolicyGroup, egressPolicies []*PolicyGroup, profileIDs []string) []*generictables.Chain
+	PolicyGroupToIptablesChains(group *PolicyGroup) []*generictables.Chain
 
-	WorkloadInterfaceAllowChains(endpoints map[proto.WorkloadEndpointID]*proto.WorkloadEndpoint) []*iptables.Chain
+	WorkloadInterfaceAllowChains(endpoints map[proto.WorkloadEndpointID]*proto.WorkloadEndpoint) []*generictables.Chain
 
 	EndpointMarkDispatchChains(
 		epMarkMapper EndpointMarkMapper,
 		wlEndpoints map[proto.WorkloadEndpointID]*proto.WorkloadEndpoint,
 		hepEndpoints map[string]proto.HostEndpointID,
-	) []*iptables.Chain
+	) []*generictables.Chain
 
-	HostDispatchChains(map[string]proto.HostEndpointID, string, bool) []*iptables.Chain
-	FromHostDispatchChains(map[string]proto.HostEndpointID, string) []*iptables.Chain
-	ToHostDispatchChains(map[string]proto.HostEndpointID, string) []*iptables.Chain
+	HostDispatchChains(map[string]proto.HostEndpointID, string, bool) []*generictables.Chain
+	FromHostDispatchChains(map[string]proto.HostEndpointID, string) []*generictables.Chain
+	ToHostDispatchChains(map[string]proto.HostEndpointID, string) []*generictables.Chain
 	HostEndpointToFilterChains(
 		ifaceName string,
 		epMarkMapper EndpointMarkMapper,
-		ingressPolicyNames []string,
-		egressPolicyNames []string,
-		ingressForwardPolicyNames []string,
-		egressForwardPolicyNames []string,
+		ingressPolicies []*PolicyGroup,
+		egressPolicies []*PolicyGroup,
+		ingressForwardPolicies []*PolicyGroup,
+		egressForwardPolicies []*PolicyGroup,
 		profileIDs []string,
-	) []*iptables.Chain
+	) []*generictables.Chain
 	HostEndpointToMangleEgressChains(
 		ifaceName string,
-		egressPolicyNames []string,
+		egressPolicies []*PolicyGroup,
 		profileIDs []string,
-	) []*iptables.Chain
+	) []*generictables.Chain
 	HostEndpointToRawEgressChain(
 		ifaceName string,
-		egressPolicyNames []string,
-	) *iptables.Chain
+		egressPolicies []*PolicyGroup,
+	) *generictables.Chain
 	HostEndpointToRawChains(
 		ifaceName string,
-		ingressPolicyNames []string,
-		egressPolicyNames []string,
-	) []*iptables.Chain
+		ingressPolicies []*PolicyGroup,
+		egressPolicies []*PolicyGroup,
+	) []*generictables.Chain
 	HostEndpointToMangleIngressChains(
 		ifaceName string,
-		preDNATPolicyNames []string,
-	) []*iptables.Chain
+		preDNATPolicies []*PolicyGroup,
+	) []*generictables.Chain
 
-	PolicyToIptablesChains(policyID *proto.PolicyID, policy *proto.Policy, ipVersion uint8) []*iptables.Chain
-	ProfileToIptablesChains(profileID *proto.ProfileID, policy *proto.Profile, ipVersion uint8) (inbound, outbound *iptables.Chain)
-	ProtoRuleToIptablesRules(pRule *proto.Rule, ipVersion uint8) []iptables.Rule
+	PolicyToIptablesChains(policyID *proto.PolicyID, policy *proto.Policy, ipVersion uint8) []*generictables.Chain
+	ProfileToIptablesChains(profileID *proto.ProfileID, policy *proto.Profile, ipVersion uint8) (inbound, outbound *generictables.Chain)
+	ProtoRuleToIptablesRules(pRule *proto.Rule, ipVersion uint8) []generictables.Rule
 
-	MakeNatOutgoingRule(protocol string, action iptables.Action, ipVersion uint8) iptables.Rule
-	NATOutgoingChain(active bool, ipVersion uint8) *iptables.Chain
+	MakeNatOutgoingRule(protocol string, action generictables.Action, ipVersion uint8) generictables.Rule
+	NATOutgoingChain(active bool, ipVersion uint8) *generictables.Chain
 
-	DNATsToIptablesChains(dnats map[string]string) []*iptables.Chain
-	SNATsToIptablesChains(snats map[string]string) []*iptables.Chain
-	BlockedCIDRsToIptablesChains(cidrs []string, ipVersion uint8) []*iptables.Chain
+	DNATsToIptablesChains(dnats map[string]string) []*generictables.Chain
+	SNATsToIptablesChains(snats map[string]string) []*generictables.Chain
+	BlockedCIDRsToIptablesChains(cidrs []string, ipVersion uint8) []*generictables.Chain
 
-	WireguardIncomingMarkChain() *iptables.Chain
+	WireguardIncomingMarkChain() *generictables.Chain
+
+	IptablesFilterDenyAction() generictables.Action
+
+	FilterInputChainAllowWG(ipVersion uint8, c Config, allowAction generictables.Action) []generictables.Rule
+	ICMPv6Filter(action generictables.Action) []generictables.Rule
 }
 
 type DefaultRuleRenderer struct {
+	generictables.ActionFactory
+
 	Config
-	inputAcceptActions []iptables.Action
-	filterAllowAction  iptables.Action
-	mangleAllowAction  iptables.Action
-	blockCIDRAction    iptables.Action
+	inputAcceptActions       []generictables.Action
+	filterAllowAction        generictables.Action
+	mangleAllowAction        generictables.Action
+	blockCIDRAction          generictables.Action
+	iptablesFilterDenyAction generictables.Action
+
+	NewMatch func() generictables.MatchCriteria
+
+	// wildcard is the symbol to use for wildcard matches.
+	wildcard string
+
+	// maxNameLength is the maximum length of a chain name.
+	maxNameLength int
+}
+
+func (r *DefaultRuleRenderer) IptablesFilterDenyAction() generictables.Action {
+	return r.iptablesFilterDenyAction
 }
 
 func (r *DefaultRuleRenderer) ipSetConfig(ipVersion uint8) *ipsets.IPVersionConfig {
@@ -281,9 +310,10 @@ type Config struct {
 	OpenStackMetadataPort        uint16
 	OpenStackSpecialCasesEnabled bool
 
-	VXLANEnabled bool
-	VXLANPort    int
-	VXLANVNI     int
+	VXLANEnabled   bool
+	VXLANEnabledV6 bool
+	VXLANPort      int
+	VXLANVNI       int
 
 	IPIPEnabled            bool
 	FelixConfigIPIPEnabled *bool
@@ -291,15 +321,19 @@ type Config struct {
 	// by the host when sending traffic to a workload over IPIP.
 	IPIPTunnelAddress net.IP
 	// Same for VXLAN.
-	VXLANTunnelAddress net.IP
+	VXLANTunnelAddress   net.IP
+	VXLANTunnelAddressV6 net.IP
 
 	AllowVXLANPacketsFromWorkloads bool
 	AllowIPIPPacketsFromWorkloads  bool
 
 	WireguardEnabled            bool
+	WireguardEnabledV6          bool
 	WireguardInterfaceName      string
+	WireguardInterfaceNameV6    string
 	WireguardIptablesMark       uint32
 	WireguardListeningPort      int
+	WireguardListeningPortV6    int
 	WireguardEncryptHostTraffic bool
 	RouteSource                 string
 
@@ -307,6 +341,7 @@ type Config struct {
 	EndpointToHostAction      string
 	IptablesFilterAllowAction string
 	IptablesMangleAllowAction string
+	IptablesFilterDenyAction  string
 
 	FailsafeInboundHostPorts  []config.ProtoPort
 	FailsafeOutboundHostPorts []config.ProtoPort
@@ -316,10 +351,12 @@ type Config struct {
 	NATPortRange                       numorstring.Port
 	IptablesNATOutgoingInterfaceFilter string
 
-	NATOutgoingAddress net.IP
-	BPFEnabled         bool
+	NATOutgoingAddress             net.IP
+	BPFEnabled                     bool
+	BPFForceTrackPacketsFromIfaces []string
+	ServiceLoopPrevention          string
 
-	ServiceLoopPrevention string
+	NFTables bool
 }
 
 var unusedBitsInBPFMode = map[string]bool{
@@ -365,58 +402,106 @@ func (c *Config) validate() {
 func NewRenderer(config Config) RuleRenderer {
 	log.WithField("config", config).Info("Creating rule renderer.")
 	config.validate()
+
+	actions := iptables.Actions()
+	var reject generictables.Action = iptables.RejectAction{}
+	var accept generictables.Action = iptables.AcceptAction{}
+	var drop generictables.Action = iptables.DropAction{}
+	var ret generictables.Action = iptables.ReturnAction{}
+
+	if config.NFTables {
+		actions = nftables.Actions()
+		reject = nftables.RejectAction{}
+		accept = nftables.AcceptAction{}
+		drop = nftables.DropAction{}
+		ret = nftables.ReturnAction{}
+	}
+
+	newMatchFn := func() generictables.MatchCriteria {
+		if config.NFTables {
+			return nftables.Match()
+		}
+		return iptables.Match()
+	}
+
+	// First, what should we do when packets are not accepted.
+	var iptablesFilterDenyAction generictables.Action
+	switch config.IptablesFilterDenyAction {
+	case "REJECT":
+		log.Info("packets that are not passed by any policy or profile will be rejected.")
+		iptablesFilterDenyAction = reject
+	default:
+		log.Info("packets that are not passed by any policy or profile will be dropped.")
+		iptablesFilterDenyAction = drop
+	}
+
 	// Convert configured actions to rule slices.
 	// First, what should we do with packets that come from workloads to the host itself.
-	var inputAcceptActions []iptables.Action
+	var inputAcceptActions []generictables.Action
 	switch config.EndpointToHostAction {
 	case "DROP":
 		log.Info("Workload to host packets will be dropped.")
-		inputAcceptActions = []iptables.Action{iptables.DropAction{}}
+		inputAcceptActions = []generictables.Action{drop}
+	case "REJECT":
+		log.Info("Workload to host packets will be rejected.")
+		inputAcceptActions = []generictables.Action{reject}
 	case "ACCEPT":
 		log.Info("Workload to host packets will be accepted.")
-		inputAcceptActions = []iptables.Action{iptables.AcceptAction{}}
+		inputAcceptActions = []generictables.Action{accept}
 	default:
 		log.Info("Workload to host packets will be returned to INPUT chain.")
-		inputAcceptActions = []iptables.Action{iptables.ReturnAction{}}
+		inputAcceptActions = []generictables.Action{ret}
 	}
 
 	// What should we do with packets that are accepted in the forwarding chain
-	var filterAllowAction, mangleAllowAction iptables.Action
+	var filterAllowAction, mangleAllowAction generictables.Action
 	switch config.IptablesFilterAllowAction {
 	case "RETURN":
 		log.Info("filter table allowed packets will be returned to FORWARD chain.")
-		filterAllowAction = iptables.ReturnAction{}
+		filterAllowAction = ret
 	default:
 		log.Info("filter table allowed packets will be accepted immediately.")
-		filterAllowAction = iptables.AcceptAction{}
+		filterAllowAction = accept
 	}
 	switch config.IptablesMangleAllowAction {
 	case "RETURN":
 		log.Info("mangle table allowed packets will be returned to PREROUTING chain.")
-		mangleAllowAction = iptables.ReturnAction{}
+		mangleAllowAction = ret
 	default:
 		log.Info("mangle table allowed packets will be accepted immediately.")
-		mangleAllowAction = iptables.AcceptAction{}
+		mangleAllowAction = accept
 	}
 
 	// How should we block CIDRs for loop prevention?
-	var blockCIDRAction iptables.Action
+	var blockCIDRAction generictables.Action
 	switch config.ServiceLoopPrevention {
 	case "Drop":
 		log.Info("Packets to unknown service IPs will be dropped")
-		blockCIDRAction = iptables.DropAction{}
+		blockCIDRAction = drop
 	case "Reject":
 		log.Info("Packets to unknown service IPs will be rejected")
-		blockCIDRAction = iptables.RejectAction{}
+		blockCIDRAction = reject
 	default:
 		log.Info("Packets to unknown service IPs will be allowed to loop")
 	}
 
+	maxNameLength := iptables.MaxChainNameLength
+	wildcard := iptables.Wildcard
+	if config.NFTables {
+		wildcard = nftables.Wildcard
+		maxNameLength = nftables.MaxChainNameLength
+	}
+
 	return &DefaultRuleRenderer{
-		Config:             config,
-		inputAcceptActions: inputAcceptActions,
-		filterAllowAction:  filterAllowAction,
-		mangleAllowAction:  mangleAllowAction,
-		blockCIDRAction:    blockCIDRAction,
+		Config:                   config,
+		ActionFactory:            actions,
+		NewMatch:                 newMatchFn,
+		inputAcceptActions:       inputAcceptActions,
+		filterAllowAction:        filterAllowAction,
+		mangleAllowAction:        mangleAllowAction,
+		blockCIDRAction:          blockCIDRAction,
+		iptablesFilterDenyAction: iptablesFilterDenyAction,
+		wildcard:                 wildcard,
+		maxNameLength:            maxNameLength,
 	}
 }

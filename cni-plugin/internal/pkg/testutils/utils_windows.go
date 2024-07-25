@@ -4,7 +4,7 @@
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
+//	http://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
@@ -134,9 +134,9 @@ func createContainerUsingContainerd(containerId string) (string, string, error) 
 	// Create the container with ctr.exe that is shipped with containerd.
 	// When 'ctr run' is invoked, a running container is started with no
 	// networking.
-	image := "k8s.gcr.io/pause:3.5"
+	image := "k8s.gcr.io/pause:3.9"
 
-	command := fmt.Sprintf(`& 'C:\Program Files\containerd\ctr.exe' images pull %v`, image)
+	command := fmt.Sprintf(`& 'C:\Program Files\containerd\bin\ctr.exe' images pull %v`, image)
 	cmd := exec.Command("powershell.exe", command)
 
 	log.Infof("Running powershell command: %v", command)
@@ -144,7 +144,7 @@ func createContainerUsingContainerd(containerId string) (string, string, error) 
 	if err != nil {
 		return "", "", errors.New(fmt.Sprintf("failed to pull image: %v", err))
 	}
-	command = fmt.Sprintf(`& 'C:\Program Files\containerd\ctr.exe' run --detach %v %v`, image, containerId)
+	command = fmt.Sprintf(`& 'C:\Program Files\containerd\bin\ctr.exe' run --detach %v %v`, image, containerId)
 	cmd = exec.Command("powershell.exe", command)
 
 	log.Infof("Running powershell command: %v", command)
@@ -177,8 +177,8 @@ func DeleteRunningContainer(containerId string) error {
 
 	// Delete the running task and container with ctr.exe that is shipped with containerd.
 	cmds := []string{
-		fmt.Sprintf(`& 'C:\Program Files\containerd\ctr.exe' tasks kill %v`, containerId),
-		fmt.Sprintf(`& 'C:\Program Files\containerd\ctr.exe' containers delete %v`, containerId),
+		fmt.Sprintf(`& 'C:\Program Files\containerd\bin\ctr.exe' tasks kill %v`, containerId),
+		fmt.Sprintf(`& 'C:\Program Files\containerd\bin\ctr.exe' containers delete %v`, containerId),
 	}
 
 	for _, c := range cmds {
@@ -347,12 +347,12 @@ func DeleteContainer(netconf, podName, podNamespace, k8sNs string) (exitCode int
 	return DeleteContainerWithId(netconf, podName, podNamespace, "", k8sNs)
 }
 
-//func DeleteContainerWithId(netconf, netnspath, podName, podNamespace, containerId string) (exitCode int, err error) {
+// func DeleteContainerWithId(netconf, netnspath, podName, podNamespace, containerId string) (exitCode int, err error) {
 func DeleteContainerWithId(netconf, podName, podNamespace, containerId, k8sNs string) (exitCode int, err error) {
 	return DeleteContainerWithIdAndIfaceName(netconf, podName, podNamespace, containerId, "eth0", k8sNs)
 }
 
-//func DeleteContainerWithIdAndIfaceName(netconf, netnspath, podName, podNamespace, containerId, ifaceName string) (exitCode int, err error) {
+// func DeleteContainerWithIdAndIfaceName(netconf, netnspath, podName, podNamespace, containerId, ifaceName string) (exitCode int, err error) {
 func DeleteContainerWithIdAndIfaceName(netconf, podName, podNamespace, containerId, ifaceName, k8sNs string) (exitCode int, err error) {
 	k8sEnv := ""
 	if podName != "" {

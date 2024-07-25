@@ -1,4 +1,4 @@
-// Copyright (c) 2019 Tigera, Inc. All rights reserved.
+// Copyright (c) 2019-2024 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,11 +15,8 @@
 package fv_test
 
 import (
-	"os"
 	"strings"
 	"testing"
-
-	log "github.com/sirupsen/logrus"
 
 	. "github.com/onsi/gomega"
 
@@ -28,17 +25,19 @@ import (
 )
 
 func init() {
-	log.AddHook(logutils.ContextHook{})
-	log.SetFormatter(&logutils.Formatter{})
+	// Set up logging formatting.
+	logutils.ConfigureFormatter("test")
 }
 
 func TestMultiCluster(t *testing.T) {
 	RegisterTestingT(t)
 
-	os.Setenv("KUBECONFIG", strings.Join([]string{
+	unpatchEnv, err := PatchEnv("KUBECONFIG", strings.Join([]string{
 		"/go/src/github.com/projectcalico/calico/calicoctl/test-data/multi-context/kubectl-config.yaml",
 		"/go/src/github.com/projectcalico/calico/calicoctl/test-data/multi-context/kubectl-config-second.yaml",
 	}, ":"))
+	Expect(err).NotTo(HaveOccurred())
+	defer unpatchEnv()
 
 	// Set Calico version in ClusterInformation for both contexts
 	out, err := SetCalicoVersion(true, "--context", "main")
@@ -83,7 +82,7 @@ func TestMultiCluster(t *testing.T) {
 	out = Calicoctl(true, "label", "nodes", "node4", "cluster", "--remove", "--context", "main")
 	Expect(out).To(ContainSubstring("Successfully"))
 
-	// Calico spesific commands only support context at the beginning.
+	// Calico specific commands only support context at the beginning.
 	out = Calicoctl(true, "--context", "main", "ipam", "show")
 	Expect(out).To(ContainSubstring("CIDR"))
 

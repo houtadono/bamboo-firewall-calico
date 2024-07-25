@@ -18,10 +18,81 @@ import (
 	"fmt"
 
 	"github.com/projectcalico/calico/felix/environment"
+	"github.com/projectcalico/calico/felix/generictables"
 )
 
-type Action interface {
-	ToFragment(features *environment.Features) string
+func Actions() generictables.ActionFactory {
+	return &actionFactory{}
+}
+
+type actionFactory struct{}
+
+func (s *actionFactory) Allow() generictables.Action {
+	return AcceptAction{}
+}
+
+func (s *actionFactory) GoTo(target string) generictables.Action {
+	return GotoAction{Target: target}
+}
+
+func (s *actionFactory) Return() generictables.Action {
+	return ReturnAction{}
+}
+
+func (s *actionFactory) Reject(with generictables.RejectWith) generictables.Action {
+	return RejectAction{With: with}
+}
+
+func (s *actionFactory) SetMaskedMark(mark, mask uint32) generictables.Action {
+	return SetMaskedMarkAction{
+		Mark: mark,
+		Mask: mask,
+	}
+}
+
+func (s *actionFactory) SetMark(mark uint32) generictables.Action {
+	return SetMarkAction{
+		Mark: mark,
+	}
+}
+
+func (s *actionFactory) ClearMark(mark uint32) generictables.Action {
+	return ClearMarkAction{Mark: mark}
+}
+
+func (s *actionFactory) Jump(target string) generictables.Action {
+	return JumpAction{Target: target}
+}
+
+func (s *actionFactory) NoTrack() generictables.Action {
+	return NoTrackAction{}
+}
+
+func (s *actionFactory) Log(prefix string) generictables.Action {
+	return LogAction{Prefix: prefix}
+}
+
+func (s *actionFactory) SNAT(ip string) generictables.Action {
+	return SNATAction{ToAddr: ip}
+}
+
+func (s *actionFactory) DNAT(ip string, port uint16) generictables.Action {
+	return DNATAction{DestAddr: ip, DestPort: port}
+}
+
+func (s *actionFactory) Masq(toPorts string) generictables.Action {
+	return MasqAction{ToPorts: toPorts}
+}
+
+func (s *actionFactory) Drop() generictables.Action {
+	return DropAction{}
+}
+
+func (s *actionFactory) SetConnmark(mark, mask uint32) generictables.Action {
+	return SetConnMarkAction{
+		Mark: mark,
+		Mask: mask,
+	}
 }
 
 type Referrer interface {
@@ -64,10 +135,16 @@ func (g JumpAction) ReferencedChain() string {
 	return g.Target
 }
 
-var _ Referrer = JumpAction{}
+var (
+	_ Referrer                         = JumpAction{}
+	_ generictables.ReturnActionMarker = ReturnAction{}
+)
 
 type ReturnAction struct {
 	TypeReturn struct{}
+}
+
+func (r ReturnAction) IsReturnAction() {
 }
 
 func (r ReturnAction) ToFragment(features *environment.Features) string {
@@ -92,9 +169,13 @@ func (g DropAction) String() string {
 
 type RejectAction struct {
 	TypeReject struct{}
+	With       generictables.RejectWith
 }
 
 func (g RejectAction) ToFragment(features *environment.Features) string {
+	if g.With != "" {
+		return fmt.Sprintf("--jump REJECT --reject-with %s", g.With)
+	}
 	return "--jump REJECT"
 }
 
@@ -247,7 +328,7 @@ func (c SaveConnMarkAction) ToFragment(features *environment.Features) string {
 	} else {
 		mask = c.SaveMask
 	}
-	return fmt.Sprintf("--jump CONNMARK --save-mark --mark %#x", mask)
+	return fmt.Sprintf("--jump CONNMARK --save-mark --mask %#x", mask)
 }
 
 func (c SaveConnMarkAction) String() string {
@@ -267,7 +348,7 @@ func (c RestoreConnMarkAction) ToFragment(features *environment.Features) string
 	} else {
 		mask = c.RestoreMask
 	}
-	return fmt.Sprintf("--jump CONNMARK --restore-mark --mark %#x", mask)
+	return fmt.Sprintf("--jump CONNMARK --restore-mark --mask %#x", mask)
 }
 
 func (c RestoreConnMarkAction) String() string {

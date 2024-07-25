@@ -3,7 +3,7 @@ Package log provides support for logging to stdout and stderr.
 
 Log entries will be logged in the following format:
 
-    timestamp hostname [pid]: SEVERITY Message
+	timestamp hostname [pid]: SEVERITY Message
 */
 package log
 
@@ -14,8 +14,8 @@ import (
 )
 
 func init() {
-	log.AddHook(logutils.ContextHook{})
-	log.SetFormatter(&logutils.Formatter{Component: "confd"})
+	// Set up logging formatting.
+	logutils.ConfigureFormatter("confd")
 }
 
 // SetLevel sets the log level. Valid levels are panic, fatal, error, warn, info and debug.

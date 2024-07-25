@@ -20,7 +20,7 @@ import (
 
 	log "github.com/sirupsen/logrus"
 
-	"github.com/projectcalico/calico/felix/dataplane/common"
+	dpsets "github.com/projectcalico/calico/felix/dataplane/ipsets"
 	"github.com/projectcalico/calico/felix/ipsets"
 	"github.com/projectcalico/calico/libcalico-go/lib/set"
 )
@@ -29,18 +29,18 @@ import (
 type hostIPManager struct {
 	nonHostIfacesRegexp *regexp.Regexp
 	// hostIfaceToAddrs maps host interface name to the set of IPs on that interface (reported from the dataplane).
-	hostIfaceToAddrs map[string]set.Set
+	hostIfaceToAddrs map[string]set.Set[string]
 
 	hostIPSetID     string
-	ipsetsDataplane common.IPSetsDataplane
+	ipsetsDataplane dpsets.IPSetsDataplane
 	maxSize         int
 }
 
 func newHostIPManager(wlIfacesPrefixes []string,
 	ipSetID string,
-	ipsets common.IPSetsDataplane,
-	maxIPSetSize int) *hostIPManager {
-
+	ipsets dpsets.IPSetsDataplane,
+	maxIPSetSize int,
+) *hostIPManager {
 	return newHostIPManagerWithShims(
 		wlIfacesPrefixes,
 		ipSetID,
@@ -51,15 +51,15 @@ func newHostIPManager(wlIfacesPrefixes []string,
 
 func newHostIPManagerWithShims(wlIfacesPrefixes []string,
 	ipSetID string,
-	ipsets common.IPSetsDataplane,
-	maxIPSetSize int) *hostIPManager {
-
+	ipsets dpsets.IPSetsDataplane,
+	maxIPSetSize int,
+) *hostIPManager {
 	wlIfacesPattern := "^(" + strings.Join(wlIfacesPrefixes, "|") + ").*"
 	wlIfacesRegexp := regexp.MustCompile(wlIfacesPattern)
 
 	return &hostIPManager{
 		nonHostIfacesRegexp: wlIfacesRegexp,
-		hostIfaceToAddrs:    map[string]set.Set{},
+		hostIfaceToAddrs:    map[string]set.Set[string]{},
 		hostIPSetID:         ipSetID,
 		ipsetsDataplane:     ipsets,
 		maxSize:             maxIPSetSize,
@@ -69,8 +69,7 @@ func newHostIPManagerWithShims(wlIfacesPrefixes []string,
 func (m *hostIPManager) getCurrentMembers() []string {
 	members := []string{}
 	for _, addrs := range m.hostIfaceToAddrs {
-		addrs.Iter(func(item interface{}) error {
-			ip := item.(string)
+		addrs.Iter(func(ip string) error {
 			members = append(members, ip)
 			return nil
 		})

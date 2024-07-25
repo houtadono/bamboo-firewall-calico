@@ -44,12 +44,22 @@ func init() {
 
 func TestFv(t *testing.T) {
 	RegisterFailHandler(Fail)
-	junitReporter := reporters.NewJUnitReporter("../report/fv_suite.xml")
+	reportName := "fv_suite"
+	if NFTMode() {
+		reportName = "fv_nft_suite"
+	}
+	junitReporter := reporters.NewJUnitReporter(fmt.Sprintf("../report/%s.xml", reportName))
 	RunSpecsWithDefaultAndCustomReporters(t, "FV Suite", []Reporter{junitReporter})
 }
 
 var _ = BeforeEach(func() {
-	_, _ = fmt.Fprintf(realStdout, "FV-TEST-START: %s\n", CurrentGinkgoTestDescription().FullTestText)
+	_, _ = fmt.Fprintf(realStdout, "\nFV-TEST-START: %s", CurrentGinkgoTestDescription().FullTestText)
+})
+
+var _ = JustAfterEach(func() {
+	if CurrentGinkgoTestDescription().Failed {
+		_, _ = fmt.Fprintf(realStdout, "\n")
+	}
 })
 
 var _ = AfterEach(func() {
@@ -63,9 +73,11 @@ var _ = AfterEach(func() {
 })
 
 var _ = AfterSuite(func() {
-	if infrastructure.K8sInfra != nil {
-		infrastructure.TearDownK8sInfra(infrastructure.K8sInfra)
-		infrastructure.K8sInfra = nil
+	for i, k8sInfra := range infrastructure.K8sInfra {
+		if k8sInfra != nil {
+			infrastructure.TearDownK8sInfra(k8sInfra)
+			infrastructure.K8sInfra[i] = nil
+		}
 	}
 	infrastructure.RemoveTLSCredentials()
 })

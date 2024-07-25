@@ -48,22 +48,25 @@ import (
 //     +-----------------------------+  +-----------------------------+
 
 var _ = infrastructure.DatastoreDescribe("pre-dnat with initialized Felix, 2 workloads", []apiconfig.DatastoreType{apiconfig.EtcdV3, apiconfig.Kubernetes}, func(getInfra infrastructure.InfraFactory) {
-
 	var (
 		infra          infrastructure.DatastoreInfra
-		felix          *infrastructure.Felix
+		tc             infrastructure.TopologyContainers
 		client         client.Interface
 		w              [2]*workload.Workload
 		externalClient *containers.Container
 	)
 
 	BeforeEach(func() {
+		if NFTMode() {
+			Skip("This test is not yet supported in NFT mode")
+		}
+
 		infra = getInfra()
 
 		options := infrastructure.DefaultTopologyOptions()
 		// For variety, run this test with IPv6 disabled.
 		options.EnableIPv6 = false
-		felix, client = infrastructure.StartSingleNodeTopology(options, infra)
+		tc, client = infrastructure.StartSingleNodeTopology(options, infra)
 
 		// Install a default profile that allows all ingress and egress, in the absence of any Policy.
 		infra.AddDefaultAllow()
@@ -71,42 +74,36 @@ var _ = infrastructure.DatastoreDescribe("pre-dnat with initialized Felix, 2 wor
 		// Create workloads, using that profile.
 		for ii := range w {
 			iiStr := strconv.Itoa(ii)
-			w[ii] = workload.Run(felix, "w"+iiStr, "default", "10.65.0.1"+iiStr, "8055", "tcp")
+			w[ii] = workload.Run(tc.Felixes[0], "w"+iiStr, "default", "10.65.0.1"+iiStr, "8055", "tcp")
 			w[ii].ConfigureInInfra(infra)
 		}
 
 		// We will use this container to model an external client trying to connect into
 		// workloads on a host.  Create a route in the container for the workload CIDR.
-		externalClient = containers.Run("external-client",
-			containers.RunOpts{AutoRemove: true},
-			"--privileged", // So that we can add routes inside the container.
-			utils.Config.BusyboxImage,
-			"/bin/sh", "-c", "sleep 1000")
-		externalClient.Exec("ip", "r", "add", "10.65.0.0/24", "via", felix.IP)
+		externalClient = infrastructure.RunExtClient("ext-client")
+		externalClient.Exec("ip", "r", "add", "10.65.0.0/24", "via", tc.Felixes[0].IP)
 	})
 
 	AfterEach(func() {
-
 		if CurrentGinkgoTestDescription().Failed {
 			infra.DumpErrorData()
-			felix.Exec("iptables-save", "-c")
-			felix.Exec("ip", "r")
-			felix.Exec("ip", "a")
+			tc.Felixes[0].Exec("iptables-save", "-c")
+			tc.Felixes[0].Exec("ip", "r")
+			tc.Felixes[0].Exec("ip", "a")
 		}
 
 		for ii := range w {
 			w[ii].Stop()
 		}
-		felix.Stop()
+		tc.Stop()
 
 		infra.Stop()
 		externalClient.Stop()
 	})
 
 	Context("with node port DNATs", func() {
-
 		BeforeEach(func() {
-			felix.Exec(
+			tc.Felixes[0].Exec(
 				"iptables", "-t", "nat",
 				"-w", "10", // Retry this for 10 seconds, e.g. if something else is holding the lock
 				"-W", "100000", // How often to probe the lock in microsecs.
@@ -115,7 +112,7 @@ var _ = infrastructure.DatastoreDescribe("pre-dnat with initialized Felix, 2 wor
 				"-d", "10.65.0.10", "--dport", "32010",
 				"-j", "DNAT", "--to", "10.65.0.10:8055",
 			)
-			felix.Exec(
+			tc.Felixes[0].Exec(
 				"iptables", "-t", "nat",
 				"-w", "10", // Retry this for 10 seconds, e.g. if something else is holding the lock
 				"-W", "100000", // How often to probe the lock in microsecs.
@@ -136,7 +133,6 @@ var _ = infrastructure.DatastoreDescribe("pre-dnat with initialized Felix, 2 wor
 		})
 
 		Context("with pre-DNAT policy denying all ingress", func() {
-
 			BeforeEach(func() {
 				// Make sure our host endpoints won't cut felix off from the datastore.
 				err := infra.AddAllowToDatastore("has(host-endpoint)")
@@ -155,11 +151,10 @@ var _ = infrastructure.DatastoreDescribe("pre-dnat with initialized Felix, 2 wor
 			})
 
 			Context("with host endpoint applying policy to eth0", func() {
-
 				BeforeEach(func() {
 					hostEp := api.NewHostEndpoint()
 					hostEp.Name = "felix-eth0"
-					hostEp.Spec.Node = felix.Hostname
+					hostEp.Spec.Node = tc.Felixes[0].Hostname
 					hostEp.Labels = map[string]string{"host-endpoint": "true"}
 					hostEp.Spec.InterfaceName = "eth0"
 					_, err := client.HostEndpoints().Create(utils.Ctx, hostEp, utils.NoOptions)
@@ -176,7 +171,6 @@ var _ = infrastructure.DatastoreDescribe("pre-dnat with initialized Felix, 2 wor
 				})
 
 				Context("with pre-DNAT policy to open pinhole to 32010", func() {
-
 					BeforeEach(func() {
 						policy := api.NewGlobalNetworkPolicy()
 						policy.Name = "allow-ingress-32010"
@@ -209,7 +203,6 @@ var _ = infrastructure.DatastoreDescribe("pre-dnat with initialized Felix, 2 wor
 				})
 
 				Context("with pre-DNAT policy to open pinhole to 8055", func() {
-
 					BeforeEach(func() {
 						policy := api.NewGlobalNetworkPolicy()
 						policy.Name = "allow-ingress-8055"
@@ -243,11 +236,10 @@ var _ = infrastructure.DatastoreDescribe("pre-dnat with initialized Felix, 2 wor
 			})
 
 			Context("with all-interfaces host endpoint", func() {
-
 				BeforeEach(func() {
 					hostEp := api.NewHostEndpoint()
 					hostEp.Name = "felix-all"
-					hostEp.Spec.Node = felix.Hostname
+					hostEp.Spec.Node = tc.Felixes[0].Hostname
 					hostEp.Labels = map[string]string{"host-endpoint": "true"}
 					hostEp.Spec.InterfaceName = "*"
 					_, err := client.HostEndpoints().Create(utils.Ctx, hostEp, utils.NoOptions)
@@ -264,7 +256,6 @@ var _ = infrastructure.DatastoreDescribe("pre-dnat with initialized Felix, 2 wor
 				})
 
 				Context("with pre-DNAT policy to open pinhole via 32010", func() {
-
 					BeforeEach(func() {
 						policy := api.NewGlobalNetworkPolicy()
 						policy.Name = "allow-via-32010"
@@ -296,16 +287,17 @@ var _ = infrastructure.DatastoreDescribe("pre-dnat with initialized Felix, 2 wor
 					})
 
 					Context("with workload egress policy to deny 32010 flow", func() {
-
 						BeforeEach(func() {
 							policy := api.NewNetworkPolicy()
 							policy.Name = "deny-to-32010"
 							policy.Namespace = "default"
 							order := float64(10)
 							policy.Spec.Order = &order
-							policy.Spec.Egress = []api.Rule{{
-								Action:      api.Deny,
-								Destination: api.EntityRule{Selector: "name=='" + w[0].Name + "'"}},
+							policy.Spec.Egress = []api.Rule{
+								{
+									Action:      api.Deny,
+									Destination: api.EntityRule{Selector: "name=='" + w[0].Name + "'"},
+								},
 							}
 							policy.Spec.Selector = "name=='" + w[1].Name + "'"
 							_, err := client.NetworkPolicies().Create(utils.Ctx, policy, utils.NoOptions)

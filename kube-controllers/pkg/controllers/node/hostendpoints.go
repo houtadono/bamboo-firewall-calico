@@ -22,7 +22,6 @@ import (
 
 	api "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 	"github.com/sirupsen/logrus"
-	log "github.com/sirupsen/logrus"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/util/workqueue"
 
@@ -92,8 +91,6 @@ func (c *autoHostEndpointController) onUpdate(update bapi.Update) {
 					}
 				}
 			}
-		default:
-			logrus.Warnf("Unexpected kind received over syncer: %s", update.KVPair.Key)
 		}
 	} else {
 		switch update.KVPair.Key.(type) {
@@ -109,8 +106,6 @@ func (c *autoHostEndpointController) onUpdate(update bapi.Update) {
 						logrus.WithError(err).Fatal()
 					}
 				}
-			default:
-				logrus.Warnf("Unexpected kind received over syncer: %s", update.KVPair.Key)
 			}
 		}
 	}
@@ -126,7 +121,7 @@ func (c *autoHostEndpointController) deleteAutoHostendpointsWithoutNodes(ctx con
 		if !hepNodeExists || !c.config.AutoHostEndpoints {
 			err := c.deleteHostendpoint(ctx, hep.Name)
 			if err != nil {
-				log.WithError(err).Warnf("failed to delete hostendpoint %q", hep.Name)
+				logrus.WithError(err).Warnf("failed to delete hostendpoint %q", hep.Name)
 				return err
 			}
 		}
@@ -139,7 +134,7 @@ func (c *autoHostEndpointController) createUpdateAutohostendpoints(ctx context.C
 	for _, node := range c.nodeCache {
 		err := c.syncAutoHostendpoint(ctx, node)
 		if err != nil {
-			log.WithError(err).Warnf("failed to sync hostendpoint for node %q", node.Name)
+			logrus.WithError(err).Warnf("failed to sync hostendpoint for node %q", node.Name)
 			return err
 		}
 	}
@@ -149,17 +144,17 @@ func (c *autoHostEndpointController) createUpdateAutohostendpoints(ctx context.C
 // syncAllAutoHostendpoints ensures that the expected auto hostendpoints exist,
 func (c *autoHostEndpointController) syncAllAutoHostendpoints(ctx context.Context) error {
 	for n := 1; n <= 5; n++ {
-		log.Debugf("syncing all hostendpoints. attempt #%v", n)
+		logrus.Debugf("syncing all hostendpoints. attempt #%v", n)
 		autoHeps, err := c.listAutoHostendpoints(ctx)
 		if err != nil {
-			log.WithError(err).Warn("failed to list hostendpoints")
+			logrus.WithError(err).Warn("failed to list hostendpoints")
 			time.Sleep(retrySleepTime)
 			continue
 		}
 
 		// Delete any dangling auto hostendpoints
 		if err := c.deleteAutoHostendpointsWithoutNodes(ctx, autoHeps); err != nil {
-			log.WithError(err).Warn("failed to delete dangling hostendpoints")
+			logrus.WithError(err).Warn("failed to delete dangling hostendpoints")
 			time.Sleep(retrySleepTime)
 			continue
 		}
@@ -168,13 +163,13 @@ func (c *autoHostEndpointController) syncAllAutoHostendpoints(ctx context.Contex
 		// for it.
 		if c.config.AutoHostEndpoints {
 			if err := c.createUpdateAutohostendpoints(ctx); err != nil {
-				log.WithError(err).Warn("failed to sync hostendpoint for nodes")
+				logrus.WithError(err).Warn("failed to sync hostendpoint for nodes")
 				time.Sleep(retrySleepTime)
 				continue
 			}
 		}
 
-		log.Info("successfully synced all hostendpoints")
+		logrus.Info("successfully synced all hostendpoints")
 		return nil
 	}
 	return fmt.Errorf("too many retries when syncing all hostendpoints")
@@ -183,7 +178,7 @@ func (c *autoHostEndpointController) syncAllAutoHostendpoints(ctx context.Contex
 // syncAutoHostendpoint syncs the auto hostendpoint for the given node.
 func (c *autoHostEndpointController) syncAutoHostendpoint(ctx context.Context, node *libapi.Node) error {
 	hepName := c.generateAutoHostendpointName(node.Name)
-	log.Debugf("syncing hostendpoint %q from node %+v", hepName, node)
+	logrus.Debugf("syncing hostendpoint %q from node %+v", hepName, node)
 
 	// Try getting the host endpoint.
 	expectedHep := c.generateAutoHostendpointFromNode(node)
@@ -201,7 +196,7 @@ func (c *autoHostEndpointController) syncAutoHostendpoint(ctx context.Context, n
 		return err
 	}
 
-	log.WithField("hep.Name", expectedHep.Name).Debug("successfully synced hostendpoint")
+	logrus.WithField("hep.Name", expectedHep.Name).Debug("successfully synced hostendpoint")
 	return nil
 }
 
@@ -209,9 +204,9 @@ func (c *autoHostEndpointController) syncAutoHostendpoint(ctx context.Context, n
 // node, retrying a few times if needed.
 func (c *autoHostEndpointController) syncAutoHostendpointWithRetries(ctx context.Context, node *libapi.Node) error {
 	for n := 1; n <= 5; n++ {
-		log.Debugf("syncing hostendpoint for node %q. attempt #%v", node.Name, n)
+		logrus.Debugf("syncing hostendpoint for node %q. attempt #%v", node.Name, n)
 		if err := c.syncAutoHostendpoint(ctx, node); err != nil {
-			log.WithError(err).Infof("failed to sync host endpoint for node %q, retrying", node.Name)
+			logrus.WithError(err).Infof("failed to sync host endpoint for node %q, retrying", node.Name)
 			time.Sleep(retrySleepTime)
 			continue
 		}
@@ -241,29 +236,30 @@ func (c *autoHostEndpointController) listAutoHostendpoints(ctx context.Context) 
 // deleteHostendpoint removes the specified hostendpoint, optionally retrying
 // the operation a few times until it succeeds.
 func (c *autoHostEndpointController) deleteHostendpoint(ctx context.Context, hepName string) error {
-	log.Debugf("deleting hostendpoint %q", hepName)
-	time.Sleep(c.rl.When(RateLimitCalicoDelete))
+	logrus.Debugf("deleting hostendpoint %q", hepName)
+	rlKey := rateLimiterItemKey{Type: RateLimitCalicoDelete, Name: hepName}
+	time.Sleep(c.rl.When(rlKey))
 	_, err := c.client.HostEndpoints().Delete(ctx, hepName, options.DeleteOptions{})
 	if err != nil {
-		log.WithError(err).Warnf("could not delete host endpoint %q", hepName)
+		logrus.WithError(err).Warnf("could not delete host endpoint %q", hepName)
 		return err
 	}
-	c.rl.Forget(RateLimitCalicoDelete)
+	c.rl.Forget(rlKey)
 
-	log.Infof("deleted hostendpoint %q", hepName)
+	logrus.Infof("deleted hostendpoint %q", hepName)
 	return nil
 }
 
 func (c *autoHostEndpointController) deleteHostendpointWithRetries(ctx context.Context, hepName string) error {
 	for n := 1; n <= 5; n++ {
-		log.Debugf("deleting hostendpoint %q. attempt #%v", hepName, n)
+		logrus.Debugf("deleting hostendpoint %q. attempt #%v", hepName, n)
 		if err := c.deleteHostendpoint(ctx, hepName); err != nil {
 			switch err.(type) {
 			case errors.ErrorResourceDoesNotExist:
-				log.Infof("did not delete hostendpoint %q because it doesn't exist", hepName)
+				logrus.Infof("did not delete hostendpoint %q because it doesn't exist", hepName)
 				return nil
 			default:
-				log.WithError(err).Infof("failed to delete host endpoint %q, retrying", hepName)
+				logrus.WithError(err).Infof("failed to delete host endpoint %q, retrying", hepName)
 				time.Sleep(retrySleepTime)
 				continue
 			}
@@ -283,14 +279,15 @@ func isAutoHostendpoint(h *api.HostEndpoint) bool {
 // createAutoHostendpoint creates an auto hostendpoint for the specified node.
 func (c *autoHostEndpointController) createAutoHostendpoint(ctx context.Context, n *libapi.Node) (*api.HostEndpoint, error) {
 	hep := c.generateAutoHostendpointFromNode(n)
+	rlKey := rateLimiterItemKey{Type: RateLimitCalicoCreate, Name: hep.Name}
 
-	time.Sleep(c.rl.When(RateLimitCalicoCreate))
+	time.Sleep(c.rl.When(rlKey))
 	res, err := c.client.HostEndpoints().Create(ctx, hep, options.SetOptions{})
 	if err != nil {
-		log.Warnf("could not create hostendpoint for node: %v", err)
+		logrus.Warnf("could not create hostendpoint for node: %v", err)
 		return nil, err
 	}
-	c.rl.Forget(RateLimitCalicoCreate)
+	c.rl.Forget(rlKey)
 	return res, nil
 }
 
@@ -325,9 +322,17 @@ func (c *autoHostEndpointController) getAutoHostendpointExpectedIPs(node *libapi
 		expectedIPs = append(expectedIPs, node.Spec.IPv4VXLANTunnelAddr)
 		ipMap[node.Spec.IPv4VXLANTunnelAddr] = struct{}{}
 	}
+	if node.Spec.IPv6VXLANTunnelAddr != "" {
+		expectedIPs = append(expectedIPs, node.Spec.IPv6VXLANTunnelAddr)
+		ipMap[node.Spec.IPv6VXLANTunnelAddr] = struct{}{}
+	}
 	if node.Spec.Wireguard != nil && node.Spec.Wireguard.InterfaceIPv4Address != "" {
 		expectedIPs = append(expectedIPs, node.Spec.Wireguard.InterfaceIPv4Address)
 		ipMap[node.Spec.Wireguard.InterfaceIPv4Address] = struct{}{}
+	}
+	if node.Spec.Wireguard != nil && node.Spec.Wireguard.InterfaceIPv6Address != "" {
+		expectedIPs = append(expectedIPs, node.Spec.Wireguard.InterfaceIPv6Address)
+		ipMap[node.Spec.Wireguard.InterfaceIPv6Address] = struct{}{}
 	}
 	for _, addr := range node.Spec.Addresses {
 		// Add internal IPs only
@@ -366,20 +371,20 @@ func (c *autoHostEndpointController) generateAutoHostendpointFromNode(node *liba
 // hostendpointNeedsUpdate returns true if the current automatic hostendpoint
 // needs to be updated.
 func (c *autoHostEndpointController) hostendpointNeedsUpdate(current *api.HostEndpoint, expected *api.HostEndpoint) bool {
-	log.Debugf("checking if hostendpoint needs update\ncurrent: %#v\nexpected: %#v", current, expected)
+	logrus.Debugf("checking if hostendpoint needs update\ncurrent: %#v\nexpected: %#v", current, expected)
 	if !reflect.DeepEqual(current.Labels, expected.Labels) {
-		log.WithField("hep.Name", current.Name).Debug("hostendpoint needs update because of labels")
+		logrus.WithField("hep.Name", current.Name).Debug("hostendpoint needs update because of labels")
 		return true
 	}
 	if !reflect.DeepEqual(current.Spec.ExpectedIPs, expected.Spec.ExpectedIPs) {
-		log.WithField("hep.Name", current.Name).Debug("hostendpoint needs update because of expectedIPs")
+		logrus.WithField("hep.Name", current.Name).Debug("hostendpoint needs update because of expectedIPs")
 		return true
 	}
 	if current.Spec.InterfaceName != expected.Spec.InterfaceName {
-		log.WithField("hep.Name", current.Name).Debug("hostendpoint needs update because of interfaceName")
+		logrus.WithField("hep.Name", current.Name).Debug("hostendpoint needs update because of interfaceName")
 		return true
 	}
-	log.WithField("hep.Name", current.Name).Debug("hostendpoint does not need update")
+	logrus.WithField("hep.Name", current.Name).Debug("hostendpoint does not need update")
 	return false
 }
 
@@ -387,18 +392,19 @@ func (c *autoHostEndpointController) hostendpointNeedsUpdate(current *api.HostEn
 // expected hostendpoint.
 func (c *autoHostEndpointController) updateHostendpoint(current *api.HostEndpoint, expected *api.HostEndpoint) error {
 	if c.hostendpointNeedsUpdate(current, expected) {
-		log.WithField("hep.Name", current.Name).Debug("hostendpoint needs update")
+		logrus.WithField("hep.Name", current.Name).Debug("hostendpoint needs update")
 		expected.ResourceVersion = current.ResourceVersion
 		expected.ObjectMeta.CreationTimestamp = current.ObjectMeta.CreationTimestamp
 		expected.ObjectMeta.UID = current.ObjectMeta.UID
 
-		time.Sleep(c.rl.When(RateLimitCalicoUpdate))
+		rlKey := rateLimiterItemKey{Type: RateLimitCalicoUpdate, Name: current.Name}
+		time.Sleep(c.rl.When(rlKey))
 		_, err := c.client.HostEndpoints().Update(context.Background(), expected, options.SetOptions{})
 		if err == nil {
-			c.rl.Forget(RateLimitCalicoUpdate)
+			c.rl.Forget(rlKey)
 		}
 		return err
 	}
-	log.WithField("hep.Name", current.Name).Debug("hostendpoint not updated")
+	logrus.WithField("hep.Name", current.Name).Debug("hostendpoint not updated")
 	return nil
 }

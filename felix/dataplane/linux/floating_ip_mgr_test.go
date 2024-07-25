@@ -18,6 +18,7 @@ import (
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 
+	"github.com/projectcalico/calico/felix/generictables"
 	"github.com/projectcalico/calico/felix/ipsets"
 	"github.com/projectcalico/calico/felix/iptables"
 	"github.com/projectcalico/calico/felix/proto"
@@ -34,29 +35,29 @@ type snat struct {
 	extIP string
 }
 
-func expectedDNATChain(dnats ...dnat) *iptables.Chain {
-	rules := []iptables.Rule{}
+func expectedDNATChain(dnats ...dnat) *generictables.Chain {
+	rules := []generictables.Rule{}
 	for _, dnat := range dnats {
-		rules = append(rules, iptables.Rule{
+		rules = append(rules, generictables.Rule{
 			Match:  iptables.Match().DestNet(dnat.extIP),
 			Action: iptables.DNATAction{DestAddr: dnat.intIP},
 		})
 	}
-	return &iptables.Chain{
+	return &generictables.Chain{
 		Name:  "cali-fip-dnat",
 		Rules: rules,
 	}
 }
 
-func expectedSNATChain(snats ...snat) *iptables.Chain {
-	rules := []iptables.Rule{}
+func expectedSNATChain(snats ...snat) *generictables.Chain {
+	rules := []generictables.Rule{}
 	for _, snat := range snats {
-		rules = append(rules, iptables.Rule{
+		rules = append(rules, generictables.Rule{
 			Match:  iptables.Match().DestNet(snat.intIP).SourceNet(snat.intIP),
 			Action: iptables.SNATAction{ToAddr: snat.extIP},
 		})
 	}
-	return &iptables.Chain{
+	return &generictables.Chain{
 		Name:  "cali-fip-snat",
 		Rules: rules,
 	}
@@ -117,7 +118,7 @@ func floatingIPManagerTests(ipVersion uint8) func() {
 			})
 
 			It("should have empty NAT chains", func() {
-				natTable.checkChains([][]*iptables.Chain{{
+				natTable.checkChains([][]*generictables.Chain{{
 					expectedDNATChain(),
 					expectedSNATChain(),
 				}})
@@ -155,7 +156,7 @@ func floatingIPManagerTests(ipVersion uint8) func() {
 
 				It("should have expected NAT chains", func() {
 					if ipVersion == 4 {
-						natTable.checkChains([][]*iptables.Chain{{
+						natTable.checkChains([][]*generictables.Chain{{
 							expectedDNATChain([]dnat{
 								{extIP: "172.16.1.3", intIP: "10.0.240.2"},
 								{extIP: "172.18.1.4", intIP: "10.0.240.2"},
@@ -165,7 +166,7 @@ func floatingIPManagerTests(ipVersion uint8) func() {
 							}...),
 						}})
 					} else {
-						natTable.checkChains([][]*iptables.Chain{{
+						natTable.checkChains([][]*generictables.Chain{{
 							expectedDNATChain([]dnat{
 								{extIP: "2001:db8:3::2", intIP: "2001:db8:2::2"},
 								{extIP: "2001:db8:4::2", intIP: "2001:db8:2::2"},
@@ -191,7 +192,7 @@ func floatingIPManagerTests(ipVersion uint8) func() {
 					})
 
 					It("should have empty NAT chains", func() {
-						natTable.checkChains([][]*iptables.Chain{{
+						natTable.checkChains([][]*generictables.Chain{{
 							expectedDNATChain(),
 							expectedSNATChain(),
 						}})
@@ -223,13 +224,13 @@ func floatingIPManagerTests(ipVersion uint8) func() {
 			})
 
 			It("should have empty NAT chains", func() {
-				natTable.checkChains([][]*iptables.Chain{{
+				natTable.checkChains([][]*generictables.Chain{{
 					expectedDNATChain(),
 					expectedSNATChain(),
 				}})
 			})
 
-			Context("with floating IPs added to the endpoint", func() {
+			Context("with non-OpenStack floating IPs added to the endpoint", func() {
 				JustBeforeEach(func() {
 					fipMgr.enabled = false
 					fipMgr.OnUpdate(&proto.WorkloadEndpointUpdate{
@@ -261,7 +262,7 @@ func floatingIPManagerTests(ipVersion uint8) func() {
 				})
 
 				It("should have empty NAT chains", func() {
-					natTable.checkChains([][]*iptables.Chain{{
+					natTable.checkChains([][]*generictables.Chain{{
 						expectedDNATChain(),
 						expectedSNATChain(),
 					}})
@@ -281,7 +282,84 @@ func floatingIPManagerTests(ipVersion uint8) func() {
 					})
 
 					It("should have empty NAT chains", func() {
-						natTable.checkChains([][]*iptables.Chain{{
+						natTable.checkChains([][]*generictables.Chain{{
+							expectedDNATChain(),
+							expectedSNATChain(),
+						}})
+					})
+				})
+			})
+
+			Context("with OpenStack-configured floating IPs added to the endpoint", func() {
+				JustBeforeEach(func() {
+					fipMgr.enabled = false
+					fipMgr.OnUpdate(&proto.WorkloadEndpointUpdate{
+						Id: &proto.WorkloadEndpointID{
+							OrchestratorId: "openstack",
+							WorkloadId:     "vm-11",
+							EndpointId:     "endpoint-id-11",
+						},
+						Endpoint: &proto.WorkloadEndpoint{
+							State:      "up",
+							Mac:        "01:02:03:04:05:06",
+							Name:       "cali12345-ab",
+							ProfileIds: []string{},
+							Tiers:      []*proto.TierInfo{},
+							Ipv4Nets:   []string{"10.0.240.2/24"},
+							Ipv6Nets:   []string{"2001:db8:2::2/128"},
+							Ipv4Nat: []*proto.NatInfo{
+								{ExtIp: "172.16.1.3", IntIp: "10.0.240.2"},
+								{ExtIp: "172.18.1.4", IntIp: "10.0.240.2"},
+							},
+							Ipv6Nat: []*proto.NatInfo{
+								{ExtIp: "2001:db8:3::2", IntIp: "2001:db8:2::2"},
+								{ExtIp: "2001:db8:4::2", IntIp: "2001:db8:2::2"},
+							},
+						},
+					})
+					err := fipMgr.CompleteDeferredWork()
+					Expect(err).ToNot(HaveOccurred())
+				})
+
+				It("should have expected NAT chains", func() {
+					if ipVersion == 4 {
+						natTable.checkChains([][]*generictables.Chain{{
+							expectedDNATChain([]dnat{
+								{extIP: "172.16.1.3", intIP: "10.0.240.2"},
+								{extIP: "172.18.1.4", intIP: "10.0.240.2"},
+							}...),
+							expectedSNATChain([]snat{
+								{extIP: "172.16.1.3", intIP: "10.0.240.2"},
+							}...),
+						}})
+					} else {
+						natTable.checkChains([][]*generictables.Chain{{
+							expectedDNATChain([]dnat{
+								{extIP: "2001:db8:3::2", intIP: "2001:db8:2::2"},
+								{extIP: "2001:db8:4::2", intIP: "2001:db8:2::2"},
+							}...),
+							expectedSNATChain([]snat{
+								{extIP: "2001:db8:3::2", intIP: "2001:db8:2::2"},
+							}...),
+						}})
+					}
+				})
+
+				Context("with the endpoint removed", func() {
+					JustBeforeEach(func() {
+						fipMgr.OnUpdate(&proto.WorkloadEndpointRemove{
+							Id: &proto.WorkloadEndpointID{
+								OrchestratorId: "openstack",
+								WorkloadId:     "vm-11",
+								EndpointId:     "endpoint-id-11",
+							},
+						})
+						err := fipMgr.CompleteDeferredWork()
+						Expect(err).ToNot(HaveOccurred())
+					})
+
+					It("should have empty NAT chains", func() {
+						natTable.checkChains([][]*generictables.Chain{{
 							expectedDNATChain(),
 							expectedSNATChain(),
 						}})

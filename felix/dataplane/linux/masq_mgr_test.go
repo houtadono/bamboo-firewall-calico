@@ -18,7 +18,8 @@ import (
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 
-	"github.com/projectcalico/calico/felix/dataplane/common"
+	dpsets "github.com/projectcalico/calico/felix/dataplane/ipsets"
+	"github.com/projectcalico/calico/felix/generictables"
 	"github.com/projectcalico/calico/felix/ipsets"
 	"github.com/projectcalico/calico/felix/iptables"
 	"github.com/projectcalico/calico/felix/proto"
@@ -30,12 +31,12 @@ var _ = Describe("Masquerade manager", func() {
 	var (
 		masqMgr      *masqManager
 		natTable     *mockTable
-		ipSets       *common.MockIPSets
+		ipSets       *dpsets.MockIPSets
 		ruleRenderer rules.RuleRenderer
 	)
 
 	BeforeEach(func() {
-		ipSets = common.NewMockIPSets()
+		ipSets = dpsets.NewMockIPSets()
 		natTable = newMockTable("nat")
 		ruleRenderer = rules.NewRenderer(rules.Config{
 			IPSetConfigV4: ipsets.NewIPVersionConfig(
@@ -54,9 +55,9 @@ var _ = Describe("Masquerade manager", func() {
 	})
 
 	It("should create its IP sets on startup", func() {
-		Expect(ipSets.Members).To(Equal(map[string]set.Set{
-			"all-ipam-pools":  set.New(),
-			"masq-ipam-pools": set.New(),
+		Expect(ipSets.Members).To(Equal(map[string]set.Set[string]{
+			"all-ipam-pools":  set.New[string](),
+			"masq-ipam-pools": set.New[string](),
 		}))
 	})
 
@@ -89,9 +90,9 @@ var _ = Describe("Masquerade manager", func() {
 		})
 		It("should program the chain", func() {
 			Expect(natTable.UpdateCalled).To(BeTrue())
-			natTable.checkChains([][]*iptables.Chain{{{
+			natTable.checkChains([][]*generictables.Chain{{{
 				Name: "cali-nat-outgoing",
-				Rules: []iptables.Rule{
+				Rules: []generictables.Rule{
 					{
 						Action: iptables.MasqAction{},
 						Match: iptables.Match().
@@ -139,9 +140,9 @@ var _ = Describe("Masquerade manager", func() {
 					"10.0.0.0/16", "10.2.0.0/16")))
 			})
 			It("should program the chain", func() {
-				natTable.checkChains([][]*iptables.Chain{{{
+				natTable.checkChains([][]*generictables.Chain{{{
 					Name: "cali-nat-outgoing",
-					Rules: []iptables.Rule{
+					Rules: []generictables.Rule{
 						{
 							Action: iptables.MasqAction{},
 							Match: iptables.Match().
@@ -161,14 +162,14 @@ var _ = Describe("Masquerade manager", func() {
 					Expect(err).ToNot(HaveOccurred())
 				})
 				It("should remove from the masq IP set", func() {
-					Expect(ipSets.Members["masq-ipam-pools"]).To(Equal(set.New()))
+					Expect(ipSets.Members["masq-ipam-pools"]).To(Equal(set.New[string]()))
 				})
 				It("should remove from the all IP set", func() {
 					Expect(ipSets.Members["all-ipam-pools"]).To(Equal(set.From(
 						"10.2.0.0/16")))
 				})
 				It("should program empty chain", func() {
-					natTable.checkChains([][]*iptables.Chain{{{
+					natTable.checkChains([][]*generictables.Chain{{{
 						Name:  "cali-nat-outgoing",
 						Rules: nil,
 					}}})
@@ -183,13 +184,13 @@ var _ = Describe("Masquerade manager", func() {
 						Expect(err).ToNot(HaveOccurred())
 					})
 					It("masq set should be empty", func() {
-						Expect(ipSets.Members["masq-ipam-pools"]).To(Equal(set.New()))
+						Expect(ipSets.Members["masq-ipam-pools"]).To(Equal(set.New[string]()))
 					})
 					It("all set should be empty", func() {
-						Expect(ipSets.Members["all-ipam-pools"]).To(Equal(set.New()))
+						Expect(ipSets.Members["all-ipam-pools"]).To(Equal(set.New[string]()))
 					})
 					It("should program empty chain", func() {
-						natTable.checkChains([][]*iptables.Chain{{{
+						natTable.checkChains([][]*generictables.Chain{{{
 							Name:  "cali-nat-outgoing",
 							Rules: nil,
 						}}})
@@ -213,13 +214,13 @@ var _ = Describe("Masquerade manager", func() {
 		})
 
 		It("should not add the pool to the masq IP set", func() {
-			Expect(ipSets.Members["masq-ipam-pools"]).To(Equal(set.New()))
+			Expect(ipSets.Members["masq-ipam-pools"]).To(Equal(set.New[string]()))
 		})
 		It("should add the pool to the all IP set", func() {
 			Expect(ipSets.Members["all-ipam-pools"]).To(Equal(set.From("10.0.0.0/16")))
 		})
 		It("should program empty chain", func() {
-			natTable.checkChains([][]*iptables.Chain{{{
+			natTable.checkChains([][]*generictables.Chain{{{
 				Name:  "cali-nat-outgoing",
 				Rules: nil,
 			}}})

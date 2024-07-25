@@ -20,8 +20,8 @@ import (
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 
+	"github.com/projectcalico/calico/felix/generictables"
 	"github.com/projectcalico/calico/felix/ipsets"
-	"github.com/projectcalico/calico/felix/iptables"
 	"github.com/projectcalico/calico/felix/proto"
 	"github.com/projectcalico/calico/felix/rules"
 	"github.com/projectcalico/calico/libcalico-go/lib/set"
@@ -67,11 +67,11 @@ var _ = Describe("Policy manager", func() {
 		})
 
 		It("should install the in and out chain", func() {
-			filterTable.checkChains([][]*iptables.Chain{{
+			filterTable.checkChains([][]*generictables.Chain{{
 				{Name: "cali-pi-pol1"},
 				{Name: "cali-po-pol1"},
 			}})
-			mangleTable.checkChains([][]*iptables.Chain{{
+			mangleTable.checkChains([][]*generictables.Chain{{
 				{Name: "cali-pi-pol1"},
 				{Name: "cali-po-pol1"},
 			}})
@@ -85,8 +85,8 @@ var _ = Describe("Policy manager", func() {
 			})
 
 			It("should remove the in and out chain", func() {
-				filterTable.checkChains([][]*iptables.Chain{})
-				mangleTable.checkChains([][]*iptables.Chain{})
+				filterTable.checkChains([][]*generictables.Chain{})
+				mangleTable.checkChains([][]*generictables.Chain{})
 			})
 		})
 	})
@@ -110,19 +110,19 @@ var _ = Describe("Policy manager", func() {
 		})
 
 		It("should install the raw chains", func() {
-			rawTable.checkChains([][]*iptables.Chain{{
+			rawTable.checkChains([][]*generictables.Chain{{
 				{Name: "cali-pi-pol1"},
 				{Name: "cali-po-pol1"},
 			}})
 		})
 		It("should install to the filter table", func() {
-			filterTable.checkChains([][]*iptables.Chain{{
+			filterTable.checkChains([][]*generictables.Chain{{
 				{Name: "cali-pi-pol1"},
 				{Name: "cali-po-pol1"},
 			}})
 		})
 		It("should install to the mangle table", func() {
-			mangleTable.checkChains([][]*iptables.Chain{{
+			mangleTable.checkChains([][]*generictables.Chain{{
 				{Name: "cali-pi-pol1"},
 				{Name: "cali-po-pol1"},
 			}})
@@ -136,13 +136,13 @@ var _ = Describe("Policy manager", func() {
 			})
 
 			It("should remove the raw chains", func() {
-				rawTable.checkChains([][]*iptables.Chain{})
+				rawTable.checkChains([][]*generictables.Chain{})
 			})
 			It("should not insert any filter chains", func() {
-				filterTable.checkChains([][]*iptables.Chain{})
+				filterTable.checkChains([][]*generictables.Chain{})
 			})
 			It("should remove any mangle chains", func() {
-				mangleTable.checkChains([][]*iptables.Chain{})
+				mangleTable.checkChains([][]*generictables.Chain{})
 			})
 		})
 	})
@@ -166,19 +166,19 @@ var _ = Describe("Policy manager", func() {
 		})
 
 		It("should install the raw chains", func() {
-			rawTable.checkChains([][]*iptables.Chain{{
+			rawTable.checkChains([][]*generictables.Chain{{
 				{Name: "cali-pi-pol1"},
 				{Name: "cali-po-pol1"},
 			}})
 		})
 		It("should install to the filter table", func() {
-			filterTable.checkChains([][]*iptables.Chain{{
+			filterTable.checkChains([][]*generictables.Chain{{
 				{Name: "cali-pi-pol1"},
 				{Name: "cali-po-pol1"},
 			}})
 		})
 		It("should install to the mangle table", func() {
-			mangleTable.checkChains([][]*iptables.Chain{{
+			mangleTable.checkChains([][]*generictables.Chain{{
 				{Name: "cali-pi-pol1"},
 				{Name: "cali-po-pol1"},
 			}})
@@ -192,13 +192,13 @@ var _ = Describe("Policy manager", func() {
 			})
 
 			It("should remove the raw chains", func() {
-				rawTable.checkChains([][]*iptables.Chain{})
+				rawTable.checkChains([][]*generictables.Chain{})
 			})
 			It("should not insert any filter chains", func() {
-				filterTable.checkChains([][]*iptables.Chain{})
+				filterTable.checkChains([][]*generictables.Chain{})
 			})
 			It("should remove any mangle chains", func() {
-				mangleTable.checkChains([][]*iptables.Chain{})
+				mangleTable.checkChains([][]*generictables.Chain{})
 			})
 		})
 	})
@@ -221,14 +221,14 @@ var _ = Describe("Policy manager", func() {
 		})
 
 		It("should install the in and out chain", func() {
-			filterTable.checkChains([][]*iptables.Chain{{
+			filterTable.checkChains([][]*generictables.Chain{{
 				{Name: "cali-pri-prof1"},
 				{Name: "cali-pro-prof1"},
 			}})
 		})
 
 		It("should install the out chain to the mangle table", func() {
-			mangleTable.checkChains([][]*iptables.Chain{{
+			mangleTable.checkChains([][]*generictables.Chain{{
 				{Name: "cali-pro-prof1"},
 			}})
 		})
@@ -241,8 +241,8 @@ var _ = Describe("Policy manager", func() {
 			})
 
 			It("should remove the in and out chain", func() {
-				filterTable.checkChains([][]*iptables.Chain{})
-				mangleTable.checkChains([][]*iptables.Chain{})
+				filterTable.checkChains([][]*generictables.Chain{})
+				mangleTable.checkChains([][]*generictables.Chain{})
 			})
 		})
 	})
@@ -250,12 +250,15 @@ var _ = Describe("Policy manager", func() {
 
 var _ = Describe("Raw egress policy manager", func() {
 	var (
-		policyMgr    *policyManager
-		rawTable     *mockTable
-		neededIPSets set.Set
+		policyMgr        *policyManager
+		rawTable         *mockTable
+		neededIPSets     set.Set[string]
+		numCallbackCalls int
 	)
 
 	BeforeEach(func() {
+		neededIPSets = nil
+		numCallbackCalls = 0
 		rawTable = newMockTable("raw")
 		ruleRenderer := rules.NewRenderer(rules.Config{
 			IPSetConfigV4:               ipsets.NewIPVersionConfig(ipsets.IPFamilyV4, "cali", nil, nil),
@@ -267,7 +270,27 @@ var _ = Describe("Raw egress policy manager", func() {
 			IptablesMarkEndpoint:        0xff00,
 			IptablesMarkNonCaliEndpoint: 0x0100,
 		})
-		policyMgr = newRawEgressPolicyManager(rawTable, ruleRenderer, 4, func(ipSets set.Set) { neededIPSets = ipSets })
+		policyMgr = newRawEgressPolicyManager(
+			rawTable,
+			ruleRenderer,
+			4,
+			func(ipSets set.Set[string]) {
+				neededIPSets = ipSets
+				numCallbackCalls++
+			})
+	})
+
+	It("correctly reports no IP sets at start of day", func() {
+		err := policyMgr.CompleteDeferredWork()
+		Expect(err).NotTo(HaveOccurred())
+		Expect(neededIPSets).ToNot(BeNil())
+		Expect(neededIPSets.Len()).To(BeZero())
+		Expect(numCallbackCalls).To(Equal(1))
+
+		By("Not repeating the callback.")
+		err = policyMgr.CompleteDeferredWork()
+		Expect(err).NotTo(HaveOccurred())
+		Expect(numCallbackCalls).To(Equal(1))
 	})
 
 	It("correctly reports needed IP sets", func() {
@@ -277,7 +300,7 @@ var _ = Describe("Raw egress policy manager", func() {
 			Policy: &proto.Policy{
 				Untracked: true,
 				OutboundRules: []*proto.Rule{
-					&proto.Rule{
+					{
 						Action:      "deny",
 						DstIpSetIds: []string{"ipsetA"},
 					},
@@ -295,7 +318,7 @@ var _ = Describe("Raw egress policy manager", func() {
 			Policy: &proto.Policy{
 				Untracked: true,
 				OutboundRules: []*proto.Rule{
-					&proto.Rule{
+					{
 						Action:      "deny",
 						DstIpSetIds: []string{"ipsetB"},
 					},
@@ -312,7 +335,7 @@ var _ = Describe("Raw egress policy manager", func() {
 			Id: &proto.PolicyID{Tier: "default", Name: "pol3"},
 			Policy: &proto.Policy{
 				OutboundRules: []*proto.Rule{
-					&proto.Rule{
+					{
 						Action:      "deny",
 						DstIpSetIds: []string{"ipsetC"},
 					},
@@ -356,7 +379,7 @@ func MatchIPSets(items ...interface{}) *ipSetsMatcher {
 }
 
 func (m *ipSetsMatcher) Match(actual interface{}) (success bool, err error) {
-	actualSet := actual.(set.Set)
+	actualSet := actual.(set.Set[string])
 	actualCopy := actualSet.Copy()
 	for _, expected := range m.items {
 		actualCopy.Add("cali40" + expected.(string))
@@ -366,29 +389,29 @@ func (m *ipSetsMatcher) Match(actual interface{}) (success bool, err error) {
 }
 
 func (m *ipSetsMatcher) FailureMessage(actual interface{}) (message string) {
-	return fmt.Sprintf("Expected %v to match IP set IDs: %v", actual.(set.Set), m.items)
+	return fmt.Sprintf("Expected %v to match IP set IDs: %v", actual.(set.Set[string]), m.items)
 }
 
 func (m *ipSetsMatcher) NegatedFailureMessage(actual interface{}) (message string) {
-	return fmt.Sprintf("Expected %v not to match IP set IDs: %v", actual.(set.Set), m.items)
+	return fmt.Sprintf("Expected %v not to match IP set IDs: %v", actual.(set.Set[string]), m.items)
 }
 
-type mockPolRenderer struct {
-}
+type mockPolRenderer struct{}
 
-func (r *mockPolRenderer) PolicyToIptablesChains(policyID *proto.PolicyID, policy *proto.Policy, ipVersion uint8) []*iptables.Chain {
+func (r *mockPolRenderer) PolicyToIptablesChains(policyID *proto.PolicyID, policy *proto.Policy, ipVersion uint8) []*generictables.Chain {
 	inName := rules.PolicyChainName(rules.PolicyInboundPfx, policyID)
 	outName := rules.PolicyChainName(rules.PolicyOutboundPfx, policyID)
-	return []*iptables.Chain{
+	return []*generictables.Chain{
 		{Name: inName},
 		{Name: outName},
 	}
 }
-func (r *mockPolRenderer) ProfileToIptablesChains(profID *proto.ProfileID, policy *proto.Profile, ipVersion uint8) (inbound, outbound *iptables.Chain) {
-	inbound = &iptables.Chain{
+
+func (r *mockPolRenderer) ProfileToIptablesChains(profID *proto.ProfileID, policy *proto.Profile, ipVersion uint8) (inbound, outbound *generictables.Chain) {
+	inbound = &generictables.Chain{
 		Name: rules.ProfileChainName(rules.ProfileInboundPfx, profID),
 	}
-	outbound = &iptables.Chain{
+	outbound = &generictables.Chain{
 		Name: rules.ProfileChainName(rules.ProfileOutboundPfx, profID),
 	}
 	return

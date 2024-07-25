@@ -30,10 +30,9 @@ import (
 )
 
 var _ = infrastructure.DatastoreDescribe("_BPF-SAFE_ iptables cleanup tests", []apiconfig.DatastoreType{apiconfig.Kubernetes}, func(getInfra infrastructure.InfraFactory) {
-
 	var (
 		infra   infrastructure.DatastoreInfra
-		felix   *infrastructure.Felix
+		tc      infrastructure.TopologyContainers
 		options infrastructure.TopologyOptions
 	)
 
@@ -41,16 +40,19 @@ var _ = infrastructure.DatastoreDescribe("_BPF-SAFE_ iptables cleanup tests", []
 		infra = getInfra()
 		options = infrastructure.DefaultTopologyOptions()
 		options.ExtraEnvVars["FELIX_IptablesRefreshInterval"] = "1" // Make sure Felix re-scans iptables frequently
-		felix, _ = infrastructure.StartSingleNodeTopology(options, infra)
+		tc, _ = infrastructure.StartSingleNodeTopology(options, infra)
 	})
 
 	Describe("with a range of rules in iptables", func() {
 		BeforeEach(func() {
-			err := felix.CopyFileIntoContainer("iptables-dump.txt", "/iptables-dump.txt")
+			if NFTMode() {
+				Skip("This test is not yet supported in nftables mode")
+			}
+			err := tc.Felixes[0].CopyFileIntoContainer("iptables-dump.txt", "/iptables-dump.txt")
 			Expect(err).ToNot(HaveOccurred(), "Failed to copy iptables dump into felix container")
 			Eventually(func() error {
 				// Can fail if felix is trying to do a concurrent update.  Just keep trying...
-				return felix.ExecMayFail("iptables-restore", "/iptables-dump.txt")
+				return tc.Felixes[0].ExecMayFail("iptables-restore", "/iptables-dump.txt")
 			}, "5s", "100ms").ShouldNot(HaveOccurred())
 		})
 
@@ -59,7 +61,7 @@ var _ = infrastructure.DatastoreDescribe("_BPF-SAFE_ iptables cleanup tests", []
 		const caliChainsThatShouldBeCleanedUp = `cali-old-chain`
 
 		dumpIptables := func() string {
-			out, err := felix.ExecOutput("iptables-save")
+			out, err := tc.Felixes[0].ExecOutput("iptables-save")
 			Expect(err).NotTo(HaveOccurred())
 			return out
 		}
@@ -81,15 +83,15 @@ var _ = infrastructure.DatastoreDescribe("_BPF-SAFE_ iptables cleanup tests", []
 
 	JustAfterEach(func() {
 		if CurrentGinkgoTestDescription().Failed {
-			felix.Exec("iptables-save", "-c")
-			felix.Exec("ip", "r")
+			tc.Felixes[0].Exec("iptables-save", "-c")
+			tc.Felixes[0].Exec("ip", "r")
 		}
 	})
 
 	AfterEach(func() {
 		log.Info("AfterEach starting")
-		felix.Exec("calico-bpf", "connect-time", "clean")
-		felix.Stop()
+		tc.Felixes[0].Exec("calico-bpf", "connect-time", "clean")
+		tc.Stop()
 		infra.Stop()
 		log.Info("AfterEach done")
 	})

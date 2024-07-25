@@ -17,18 +17,19 @@ package policysync_test
 import (
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"net"
 	"os"
 	"path"
 	"reflect"
 
+	"context"
+
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 	"github.com/onsi/gomega/types"
-	"golang.org/x/net/context"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/credentials/insecure"
 
 	"github.com/projectcalico/calico/felix/policysync"
 	"github.com/projectcalico/calico/felix/proto"
@@ -1396,7 +1397,7 @@ func makeIPAndPort(i int) string {
 
 func getDialOptions() []grpc.DialOption {
 	return []grpc.DialOption{
-		grpc.WithInsecure(),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithContextDialer(getDialer("unix"))}
 }
 
@@ -1410,7 +1411,7 @@ func getDialer(proto string) func(context.Context, string) (net.Conn, error) {
 const ListenerSocket = "policysync.sock"
 
 func makeTmpListenerDir() string {
-	dirPath, err := ioutil.TempDir("/tmp", "felixut")
+	dirPath, err := os.MkdirTemp("/tmp", "felixut")
 	Expect(err).ToNot(HaveOccurred())
 	return dirPath
 }

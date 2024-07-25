@@ -16,6 +16,7 @@ package iptables_test
 
 import (
 	"github.com/projectcalico/calico/felix/environment"
+	"github.com/projectcalico/calico/felix/generictables"
 	. "github.com/projectcalico/calico/felix/iptables"
 
 	. "github.com/onsi/ginkgo/extensions/table"
@@ -23,7 +24,7 @@ import (
 )
 
 var _ = DescribeTable("Actions",
-	func(features environment.Features, action Action, expRendering string) {
+	func(features environment.Features, action generictables.Action, expRendering string) {
 		Expect(action.ToFragment(&features)).To(Equal(expRendering))
 	},
 	Entry("GotoAction", environment.Features{}, GotoAction{Target: "cali-abcd"}, "--goto cali-abcd"),
@@ -43,8 +44,8 @@ var _ = DescribeTable("Actions",
 		Mark: 0x1000,
 		Mask: 0xf000,
 	}, "--jump MARK --set-mark 0x1000/0xf000"),
-	Entry("SaveConnMarkAction", environment.Features{}, SaveConnMarkAction{SaveMask: 0x100}, "--jump CONNMARK --save-mark --mark 0x100"),
-	Entry("RestoreConnMarkAction", environment.Features{}, RestoreConnMarkAction{RestoreMask: 0x100}, "--jump CONNMARK --restore-mark --mark 0x100"),
-	Entry("SaveConnMarkAction", environment.Features{}, SaveConnMarkAction{}, "--jump CONNMARK --save-mark --mark 0xffffffff"),
-	Entry("RestoreConnMarkAction", environment.Features{}, RestoreConnMarkAction{}, "--jump CONNMARK --restore-mark --mark 0xffffffff"),
+	Entry("SaveConnMarkAction", environment.Features{}, SaveConnMarkAction{SaveMask: 0x100}, "--jump CONNMARK --save-mark --mask 0x100"),
+	Entry("RestoreConnMarkAction", environment.Features{}, RestoreConnMarkAction{RestoreMask: 0x100}, "--jump CONNMARK --restore-mark --mask 0x100"),
+	Entry("SaveConnMarkAction", environment.Features{}, SaveConnMarkAction{}, "--jump CONNMARK --save-mark --mask 0xffffffff"),
+	Entry("RestoreConnMarkAction", environment.Features{}, RestoreConnMarkAction{}, "--jump CONNMARK --restore-mark --mask 0xffffffff"),
 )

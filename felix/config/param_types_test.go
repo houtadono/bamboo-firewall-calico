@@ -59,7 +59,6 @@ var _ = DescribeTable("CIDR list parameter parsing",
 	Entry("Single CIDR", "1.1.1.1/32", []string{"1.1.1.1/32"}, true),
 	Entry("Single CIDR subnet", "1.1.1.1/24", []string{"1.1.1.0/24"}, true),
 	Entry("Mix of IP and CIDRs", "1.1.1.1/24, 2.2.2.2", []string{"1.1.1.0/24", "2.2.2.2/32"}, true),
-	Entry("Reject IPv6", "aabc::1111/32", []string{}, false),
 )
 
 var _ = DescribeTable("KeyValue list parameter parsing",
@@ -124,4 +123,52 @@ var _ = DescribeTable("IPv6 list parameter parsing",
 	Entry("Empty", " ", "", false),
 	Entry("IPv4 address", "10.1.1.2", "", false),
 	Entry("IPv6 address", "aabc::1111", "aabc::1111", true),
+)
+
+var _ = DescribeTable("String Slice parameter with InterfaceRegex parsing",
+	func(raw string, expected interface{}, expectSuccess bool) {
+		p := config.StringSliceParam{config.Metadata{
+			Name: "StringSliceParam",
+		}, config.InterfaceRegex,
+		}
+		actual, err := p.Parse(raw)
+		if expectSuccess {
+			Expect(err).To(BeNil())
+			Expect(actual).To(Equal(expected))
+		} else {
+			Expect(err).NotTo(BeNil())
+		}
+	},
+
+	Entry("StringSliceParam Empty", "", []string{}, true),
+	Entry("StringSliceParam Single valid entry", "docker0", []string{"docker0"}, true),
+	Entry("StringSliceParam Single valid entry", "cali-123", []string{"cali-123"}, true),
+	Entry("StringSliceParam Multiple valid entries", "wlp0s20f3,virbr0,docker0,br-7ec0145f6b33", []string{"wlp0s20f3", "virbr0", "docker0", "br-7ec0145f6b33"}, true),
+	Entry("StringSliceParam Single invalid entry", "cali@123", []string{}, false),
+	Entry("StringSliceParam Single invalid wildcard", "docker+", []string{"docker+"}, false),
+	Entry("StringSliceParam Multiple invalid entries", "cali-123,cali@123", []string{}, false),
+)
+
+var _ = DescribeTable("String Slice parameter with IfaceParamRegexp parsing",
+	func(raw string, expected interface{}, expectSuccess bool) {
+		p := config.StringSliceParam{config.Metadata{
+			Name: "StringSliceParam",
+		}, config.IfaceParamRegexp,
+		}
+		actual, err := p.Parse(raw)
+		if expectSuccess {
+			Expect(err).To(BeNil())
+			Expect(actual).To(Equal(expected))
+		} else {
+			Expect(err).NotTo(BeNil())
+		}
+	},
+
+	Entry("StringSliceParam Empty", "", []string{}, true),
+	Entry("StringSliceParam Single valid entry", "docker0", []string{"docker0"}, true),
+	Entry("StringSliceParam Single valid entry", "cali-123", []string{"cali-123"}, true),
+	Entry("StringSliceParam Single valid wildcard", "docker+", []string{"docker+"}, true),
+	Entry("StringSliceParam Multiple valid entries", "docker0,docker1", []string{"docker0", "docker1"}, true),
+	Entry("StringSliceParam Single invalid entry", "cali@123", []string{}, false),
+	Entry("StringSliceParam Multiple invalid entries", "cali-123,cali@123", []string{}, false),
 )

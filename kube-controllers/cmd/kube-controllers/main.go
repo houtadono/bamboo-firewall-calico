@@ -1,4 +1,4 @@
-// Copyright (c) 2017-2020 Tigera, Inc. All rights reserved.
+// Copyright (c) 2017-2024 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,18 +16,14 @@ package main
 
 import (
 	"context"
-	"crypto/tls"
 	"flag"
 	"fmt"
 	"net/http"
-	_ "net/http/pprof"
 	"os"
 	"strings"
 	"time"
 
-	"github.com/pkg/profile"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-
 	log "github.com/sirupsen/logrus"
 	"go.etcd.io/etcd/client/pkg/v3/srv"
 	"go.etcd.io/etcd/client/pkg/v3/transport"
@@ -36,13 +32,9 @@ import (
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
-	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/klog/v2"
 
-	"github.com/projectcalico/calico/libcalico-go/lib/apiconfig"
-	client "github.com/projectcalico/calico/libcalico-go/lib/clientv3"
-	"github.com/projectcalico/calico/libcalico-go/lib/logutils"
-
+	"github.com/projectcalico/calico/crypto/pkg/tls"
 	"github.com/projectcalico/calico/kube-controllers/pkg/config"
 	"github.com/projectcalico/calico/kube-controllers/pkg/controllers/controller"
 	"github.com/projectcalico/calico/kube-controllers/pkg/controllers/flannelmigration"
@@ -52,12 +44,19 @@ import (
 	"github.com/projectcalico/calico/kube-controllers/pkg/controllers/pod"
 	"github.com/projectcalico/calico/kube-controllers/pkg/controllers/serviceaccount"
 	"github.com/projectcalico/calico/kube-controllers/pkg/status"
+	"github.com/projectcalico/calico/libcalico-go/lib/apiconfig"
+	client "github.com/projectcalico/calico/libcalico-go/lib/clientv3"
+	"github.com/projectcalico/calico/libcalico-go/lib/debugserver"
+	"github.com/projectcalico/calico/libcalico-go/lib/logutils"
+	"github.com/projectcalico/calico/libcalico-go/lib/winutils"
 )
 
 // VERSION is filled out during the build process (using git describe output)
-var VERSION string
-var version bool
-var statusFile string
+var (
+	VERSION    string
+	version    bool
+	statusFile string
+)
 
 func init() {
 	// Add a flag to check the version.
@@ -82,11 +81,8 @@ func main() {
 		os.Exit(0)
 	}
 
-	// Configure log formatting.
-	log.SetFormatter(&logutils.Formatter{})
-
-	// Install a hook that adds file/line no information.
-	log.AddHook(&logutils.ContextHook{})
+	// Set up logging formatting.
+	logutils.ConfigureFormatter("kube-controllers")
 
 	// Attempt to load configuration.
 	cfg := new(config.Config)
@@ -114,13 +110,37 @@ func main() {
 	// Create the context.
 	ctx, cancel := context.WithCancel(context.Background())
 
+	// Create the status file. We will only update it if we have healthchecks enabled.
+	s := status.New(statusFile)
+
 	log.Info("Ensuring Calico datastore is initialized")
-	initCtx, cancelInit := context.WithTimeout(ctx, 10*time.Second)
-	defer cancelInit()
-	err = calicoClient.EnsureInitialized(initCtx, "", "k8s")
-	if err != nil {
-		log.WithError(err).Fatal("Failed to initialize Calico datastore")
+	s.SetReady("Startup", false, "initialized to false")
+	initCtx, cancelInit := context.WithTimeout(ctx, 60*time.Second)
+	// Loop until context expires or calicoClient is initialized.
+	for {
+		err := calicoClient.EnsureInitialized(initCtx, "", "k8s")
+		if err != nil {
+			log.WithError(err).Info("Failed to initialize datastore")
+			s.SetReady(
+				"Startup",
+				false,
+				fmt.Sprintf("Error initializing datastore: %v", err),
+			)
+		} else {
+			// Exit loop
+			break
+		}
+
+		select {
+		case <-initCtx.Done():
+			log.Fatal("Failed to initialize Calico datastore")
+		case <-time.After(5 * time.Second):
+			// Try to initialize again
+		}
 	}
+	log.Info("Calico datastore is initialized")
+	s.SetReady("Startup", true, "")
+	cancelInit()
 
 	controllerCtrl := &controllerControl{
 		ctx:         ctx,
@@ -165,9 +185,6 @@ func main() {
 		controllerCtrl.InitControllers(ctx, runCfg, k8sClientset, calicoClient)
 	}
 
-	// Create the status file. We will only update it if we have healthchecks enabled.
-	s := status.New(statusFile)
-
 	if cfg.DatastoreType == "etcdv3" {
 		// If configured to do so, start an etcdv3 compaction.
 		go startCompactor(ctx, runCfg.EtcdV3CompactionPeriod)
@@ -186,8 +203,9 @@ func main() {
 		// Serve prometheus metrics.
 		log.Infof("Starting Prometheus metrics server on port %d", runCfg.PrometheusPort)
 		go func() {
-			http.Handle("/metrics", promhttp.Handler())
-			err := http.ListenAndServe(fmt.Sprintf(":%d", runCfg.PrometheusPort), nil)
+			mux := http.NewServeMux()
+			mux.Handle("/metrics", promhttp.Handler())
+			err := http.ListenAndServe(fmt.Sprintf(":%d", runCfg.PrometheusPort), mux)
 			if err != nil {
 				log.WithError(err).Fatal("Failed to serve prometheus metrics")
 			}
@@ -195,15 +213,7 @@ func main() {
 	}
 
 	if runCfg.DebugProfilePort != 0 {
-		// Run a webserver to expose memory profiling.
-		setPathOption := profile.ProfilePath("/profiles")
-		defer profile.Start(profile.CPUProfile, profile.MemProfile, setPathOption).Stop()
-		go func() {
-			err := http.ListenAndServe(fmt.Sprintf(":%d", runCfg.DebugProfilePort), nil)
-			if err != nil {
-				log.WithError(err).Fatal("Failed to start debug profiling")
-			}
-		}()
+		debugserver.StartDebugPprofServer("0.0.0.0", int(runCfg.DebugProfilePort))
 	}
 
 	// Run the controllers. This runs until a config change triggers a restart
@@ -223,6 +233,11 @@ func runHealthChecks(ctx context.Context, s *status.Status, k8sClientset *kubern
 	s.SetReady("CalicoDatastore", false, "initialized to false")
 	s.SetReady("KubeAPIServer", false, "initialized to false")
 
+	// Initialize a timeout for API calls. Start with a short timeout. We'll increase the timeout if we start seeing errors.
+	defaultTimeout := 4 * time.Second
+	maxTimeout := 16 * time.Second
+	timeout := defaultTimeout
+
 	// Loop until context expires and perform healthchecks.
 	for {
 		select {
@@ -232,9 +247,10 @@ func runHealthChecks(ctx context.Context, s *status.Status, k8sClientset *kubern
 			// carry on
 		}
 
-		// skip healthchecks if configured
-		// Datastore HealthCheck
-		healthCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		// Perform a health check against the Calico data store. Just query the
+		// default cluster information and make sure it's up-to-date, which will
+		// fail if the data store isn't working.
+		healthCtx, cancel := context.WithTimeout(ctx, timeout)
 		err := calicoClient.EnsureInitialized(healthCtx, "", "k8s")
 		if err != nil {
 			log.WithError(err).Errorf("Failed to verify datastore")
@@ -248,27 +264,14 @@ func runHealthChecks(ctx context.Context, s *status.Status, k8sClientset *kubern
 		}
 		cancel()
 
-		// Kube-apiserver HealthCheck
+		// Call the /healthz endpoint using the same clientset as our main controllers. This allows us to share a connection
+		// and gives us a good idea of whether or not the other controllers are currently experiencing issues accessing the apiserver.
+		healthCtx, cancel = context.WithTimeout(ctx, timeout)
 		healthStatus := 0
-		k8sCheckDone := make(chan interface{}, 1)
-		go func(k8sCheckDone <-chan interface{}) {
-			time.Sleep(2 * time.Second)
-			select {
-			case <-k8sCheckDone:
-				// The check has completed.
-			default:
-				// Check is still running, so report not ready.
-				s.SetReady(
-					"KubeAPIServer",
-					false,
-					"Error reaching apiserver: taking a long time to check apiserver",
-				)
-			}
-		}(k8sCheckDone)
-		k8sClientset.Discovery().RESTClient().Get().AbsPath("/healthz").Do(ctx).StatusCode(&healthStatus)
-		k8sCheckDone <- nil
+		result := k8sClientset.Discovery().RESTClient().Get().AbsPath("/healthz").Do(healthCtx).StatusCode(&healthStatus)
+		cancel()
 		if healthStatus != http.StatusOK {
-			log.WithError(err).Errorf("Failed to reach apiserver")
+			log.WithError(result.Error()).WithField("status", healthStatus).Errorf("Received bad status code from apiserver")
 			s.SetReady(
 				"KubeAPIServer",
 				false,
@@ -278,13 +281,25 @@ func runHealthChecks(ctx context.Context, s *status.Status, k8sClientset *kubern
 			s.SetReady("KubeAPIServer", true, "")
 		}
 
+		// If we encountered errors, retry again with a longer timeout.
+		if !s.GetReadiness() {
+			timeout = 2 * timeout
+			if timeout > maxTimeout {
+				timeout = maxTimeout
+			}
+			log.Infof("Health check is not ready, retrying in 2 seconds with new timeout: %s", timeout)
+			time.Sleep(2 * time.Second)
+			continue
+		}
+
+		// Success! Reset the timeout.
+		timeout = defaultTimeout
 		time.Sleep(10 * time.Second)
 	}
 }
 
 // Starts an etcdv3 compaction goroutine with the given config.
 func startCompactor(ctx context.Context, interval time.Duration) {
-
 	if interval.Nanoseconds() == 0 {
 		log.Info("Disabling periodic etcdv3 compaction")
 		return
@@ -321,7 +336,7 @@ func getClients(kubeconfig string) (*kubernetes.Clientset, client.Interface, err
 
 	// Now build the Kubernetes client, we support in-cluster config and kubeconfig
 	// as means of configuring the client.
-	k8sconfig, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
+	k8sconfig, err := winutils.BuildConfigFromFlags("", kubeconfig)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to build kubernetes client config: %s", err)
 	}
@@ -374,13 +389,16 @@ func newEtcdV3Client() (*clientv3.Client, error) {
 		KeyFile:       config.Spec.EtcdKeyFile,
 	}
 	tlsClient, err := tlsInfo.ClientConfig()
-
 	if err != nil {
 		return nil, err
 	}
 
-	// go 1.13 defaults to TLS 1.3, which we don't support just yet
-	tlsClient.MaxVersion = tls.VersionTLS13
+	baseTLSConfig := tls.NewTLSConfig()
+	tlsClient.MaxVersion = baseTLSConfig.MaxVersion
+	tlsClient.MinVersion = baseTLSConfig.MinVersion
+	tlsClient.CipherSuites = baseTLSConfig.CipherSuites
+	tlsClient.CurvePreferences = baseTLSConfig.CurvePreferences
+	tlsClient.Renegotiation = baseTLSConfig.Renegotiation
 
 	cfg := clientv3.Config{
 		Endpoints:   etcdLocation,

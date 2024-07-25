@@ -1,4 +1,4 @@
-// Copyright (c) 2016-2019,2021 Tigera, Inc. All rights reserved.
+// Copyright (c) 2016-2024 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -21,10 +21,11 @@ import (
 	"os"
 	"path"
 	"regexp"
-	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
+	"testing"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -36,11 +37,15 @@ const (
 	// message.  It can be used as follows: logrus.WithField(FieldForceFlush, true).Info("...")
 	FieldForceFlush = "__flush__"
 
-	// fieldFileName is a reserved field name used to pass the filename from the ContextHook to our Formatter.
-	fieldFileName = "__file__"
-	// fieldLineNumber is a reserved field name used to pass the line number from the ContextHook to our Formatter.
-	fieldLineNumber = "__line__"
+	// FileNameUnknown is the string used in logs if the filename/line number
+	// cannot be determined.
+	FileNameUnknown = "<nil>"
 )
+
+func init() {
+	// We need logrus to record the caller on each log entry for us.
+	log.SetReportCaller(true)
+}
 
 // FilterLevels returns all the logrus.Level values <= maxLevel.
 func FilterLevels(maxLevel log.Level) []log.Level {
@@ -53,20 +58,25 @@ func FilterLevels(maxLevel log.Level) []log.Level {
 	return levels
 }
 
+func ConfigureFormatter(componentName string) {
+	log.SetFormatter(&Formatter{Component: componentName})
+}
+
 // Formatter is our custom log formatter designed to balance ease of machine processing
 // with human readability.  Logs include:
-//    - A sortable millisecond timestamp, for scanning and correlating logs
-//    - The log level, near the beginning of the line, to aid in visual scanning
-//    - The PID of the process to make it easier to spot log discontinuities (If
-//      you are looking at two disjoint chunks of log, were they written by the
-//      same process?  Was there a restart in-between?)
-//    - The file name and line number, as essential context
-//    - The message!
-//    - Log fields appended in sorted order
+//   - A sortable millisecond timestamp, for scanning and correlating logs
+//   - The log level, near the beginning of the line, to aid in visual scanning
+//   - The PID of the process to make it easier to spot log discontinuities (If
+//     you are looking at two disjoint chunks of log, were they written by the
+//     same process?  Was there a restart in-between?)
+//   - The file name and line number, as essential context
+//   - The message!
+//   - Log fields appended in sorted order
 //
 // Example:
-//    2017-01-05 09:17:48.238 [INFO][85386] endpoint_mgr.go 434: Skipping configuration of
-//    interface because it is oper down. ifaceName="cali1234"
+//
+//	2017-01-05 09:17:48.238 [INFO][85386] endpoint_mgr.go 434: Skipping configuration of
+//	interface because it is oper down. ifaceName="cali1234"
 type Formatter struct {
 	// If specified, prepends the component to the file name. This is useful for when
 	// multiple components are logging to the same file (e.g., calico/node) for distinguishing
@@ -78,16 +88,15 @@ func (f *Formatter) Format(entry *log.Entry) ([]byte, error) {
 	stamp := entry.Time.Format("2006-01-02 15:04:05.000")
 	levelStr := strings.ToUpper(entry.Level.String())
 	pid := os.Getpid()
-	fileName := entry.Data[fieldFileName]
-	lineNo := entry.Data[fieldLineNumber]
+	fileName, lineNo := getFileInfo(entry)
 	b := entry.Buffer
 	if b == nil {
 		b = &bytes.Buffer{}
 	}
 	if f.Component != "" {
-		fmt.Fprintf(b, "%s [%s][%d] %s/%v %v: %v", stamp, levelStr, pid, f.Component, fileName, lineNo, entry.Message)
+		_, _ = fmt.Fprintf(b, "%s [%s][%d] %s/%v %v: %v", stamp, levelStr, pid, f.Component, fileName, lineNo, entry.Message)
 	} else {
-		fmt.Fprintf(b, "%s [%s][%d] %v %v: %v", stamp, levelStr, pid, fileName, lineNo, entry.Message)
+		_, _ = fmt.Fprintf(b, "%s [%s][%d] %v %v: %v", stamp, levelStr, pid, fileName, lineNo, entry.Message)
 	}
 	appendKVsAndNewLine(b, entry)
 	return b.Bytes(), nil
@@ -97,19 +106,25 @@ func (f *Formatter) Format(entry *log.Entry) ([]byte, error) {
 // already included in the syslog metadata such as timestamp and PID.  The log level _is_ included
 // because syslog doesn't seem to output it by default and it's very useful.
 //
-//    INFO endpoint_mgr.go 434: Skipping configuration of interface because it is oper down.
-//    ifaceName="cali1234"
+//	INFO endpoint_mgr.go 434: Skipping configuration of interface because it is oper down.
+//	ifaceName="cali1234"
 func FormatForSyslog(entry *log.Entry) string {
 	levelStr := strings.ToUpper(entry.Level.String())
-	fileName := entry.Data[fieldFileName]
-	lineNo := entry.Data[fieldLineNumber]
+	fileName, lineNo := getFileInfo(entry)
 	b := entry.Buffer
 	if b == nil {
 		b = &bytes.Buffer{}
 	}
-	fmt.Fprintf(b, "%s %v %v: %v", levelStr, fileName, lineNo, entry.Message)
+	_, _ = fmt.Fprintf(b, "%s %v %v: %v", levelStr, fileName, lineNo, entry.Message)
 	appendKVsAndNewLine(b, entry)
 	return b.String()
+}
+
+func getFileInfo(entry *log.Entry) (string, string) {
+	if entry.Caller == nil {
+		return FileNameUnknown, FileNameUnknown
+	}
+	return path.Base(entry.Caller.File), strconv.Itoa(entry.Caller.Line)
 }
 
 // appendKeysAndNewLine writes the KV pairs attached to the entry to the end of the buffer, then
@@ -123,7 +138,7 @@ func appendKVsAndNewLine(b *bytes.Buffer, entry *log.Entry) {
 	sort.Strings(keys)
 
 	for _, key := range keys {
-		if key == fieldFileName || key == fieldLineNumber || key == FieldForceFlush {
+		if key == FieldForceFlush {
 			continue
 		}
 		var value interface{} = entry.Data[key]
@@ -135,7 +150,7 @@ func appendKVsAndNewLine(b *bytes.Buffer, entry *log.Entry) {
 			stringifiedValue = stringer.String()
 		} else {
 			// No string method, use %#v to get a more thorough dump.
-			fmt.Fprintf(b, " %v=%#v", key, value)
+			_, _ = fmt.Fprintf(b, " %v=%#v", key, value)
 			continue
 		}
 		b.WriteByte(' ')
@@ -151,77 +166,6 @@ type NullWriter struct{}
 
 func (w *NullWriter) Write(p []byte) (int, error) {
 	return len(p), nil
-}
-
-type ContextHook struct {
-}
-
-func (hook ContextHook) Levels() []log.Level {
-	return log.AllLevels
-}
-
-func (hook ContextHook) Fire(entry *log.Entry) error {
-	// We used to do runtime.Callers(6, pcs) here so that we'd skip straight to the expected
-	// frame.  However, if an intermediate frame gets inlined we can skip too many frames in
-	// that case.  The only safe option is to use skip=1 and then let CallersFrames() deal
-	// with any inlining.
-	pcs := make([]uintptr, 20)
-	if numEntries := runtime.Callers(0, pcs); numEntries > 0 {
-		pcs = pcs[:numEntries]
-		frames := runtime.CallersFrames(pcs)
-		for {
-			frame, more := frames.Next()
-			if !shouldSkipFrame(frame) {
-				// We found the frame we were looking for.  Record its file/line number.
-				entry.Data[fieldFileName] = path.Base(frame.File)
-				entry.Data[fieldLineNumber] = frame.Line
-				break
-			}
-			if !more {
-				entry.Data[fieldFileName] = "filename-lookup-failed"
-				entry.Data[fieldLineNumber] = -1
-				break
-			}
-		}
-	} else {
-		entry.Data[fieldFileName] = "filename-lookup-failed"
-		entry.Data[fieldLineNumber] = -2
-	}
-	return nil
-}
-
-// shouldSkipFrame returns true if the given frame belongs to the logging library (or this utility package).
-// Note: this is on the critical path for every log, if you need to update it, make sure to run the
-// benchmarks.
-//
-// Some things we've tried that were worse than strings.HasSuffix():
-//
-// - using a regexp:            ~100x slower
-// - using strings.LastIndex(): ~10x slower
-// - omitting the package:      no benefit
-func shouldSkipFrame(frame runtime.Frame) bool {
-	if strings.Contains(frame.File, "runtime/extern.go") {
-		return true
-	}
-	if strings.HasSuffix(frame.File, "/hooks.go") ||
-		strings.HasSuffix(frame.File, "/entry.go") ||
-		strings.HasSuffix(frame.File, "/logger.go") ||
-		strings.HasSuffix(frame.File, "/exported.go") {
-		if strings.Contains(frame.File, "/logrus") {
-			return true
-		}
-	}
-	if strings.HasSuffix(frame.File, "/lib/logutils/logutils.go") {
-		if strings.Contains(frame.File, "/libcalico-go") {
-			return true
-		}
-	}
-	if strings.HasSuffix(frame.File, "/lib/logutils/ratelimitedlogger.go") {
-		if strings.Contains(frame.File, "/libcalico-go") {
-			return true
-		}
-	}
-	return false
 }
 
 type QueuedLog struct {
@@ -253,7 +197,7 @@ func NewStreamDestination(
 		Channel: c,
 		writeLog: func(ql QueuedLog) error {
 			if ql.NumSkippedLogs > 0 {
-				fmt.Fprintf(writer, "... dropped %d logs ...\n",
+				_, _ = fmt.Fprintf(writer, "... dropped %d logs ...\n",
 					ql.NumSkippedLogs)
 			}
 			_, err := writer.Write(ql.Message)
@@ -276,7 +220,7 @@ func NewSyslogDestination(
 		Channel: c,
 		writeLog: func(ql QueuedLog) error {
 			if ql.NumSkippedLogs > 0 {
-				writer.Warning(fmt.Sprintf("... dropped %d logs ...\n",
+				_ = writer.Warning(fmt.Sprintf("... dropped %d logs ...\n",
 					ql.NumSkippedLogs))
 			}
 			err := writeToSyslog(writer, ql)
@@ -339,7 +283,6 @@ func (d *Destination) LoopWritingLogs() {
 		if err != nil {
 			// Increment the number of errors while trying to write to log
 			d.counter.Inc()
-			fmt.Fprintf(os.Stderr, "Failed to write to log: %v", err)
 		}
 		ql.OnLogDone()
 	}
@@ -439,7 +382,8 @@ func (h *BackgroundHook) Fire(entry *log.Entry) (err error) {
 
 	if entry.Level >= log.DebugLevel && h.debugFileNameRE != nil {
 		// This is a debug log, check if debug logging is enabled for this file.
-		if fileName, ok := entry.Data[fieldFileName]; !ok || !h.debugFileNameRE.MatchString(fileName.(string)) {
+		fileName, _ := getFileInfo(entry)
+		if fileName == FileNameUnknown || !h.debugFileNameRE.MatchString(fileName) {
 			return nil
 		}
 	}
@@ -520,4 +464,41 @@ func SafeParseLogLevel(logLevel string) log.Level {
 		}
 	}
 	return defaultedLevel
+}
+
+// TestingTWriter adapts a *testing.T as a Writer so it can be used as a target
+// for logrus.  typically, it should be used via the ConfigureLoggingForTestingT
+// helper.
+type TestingTWriter struct {
+	T *testing.T
+}
+
+func (l TestingTWriter) Write(p []byte) (n int, err error) {
+	l.T.Helper()
+	l.T.Log(strings.TrimRight(string(p), "\r\n"))
+	return len(p), nil
+}
+
+// RedirectLogrusToTestingT redirects logrus output to the given testing.T.  It
+// returns a func() that can be called to restore the original log output.
+func RedirectLogrusToTestingT(t *testing.T) (cancel func()) {
+	oldOut := log.StandardLogger().Out
+	cancel = func() {
+		log.SetOutput(oldOut)
+	}
+	log.SetOutput(TestingTWriter{T: t})
+	return
+}
+
+var confForTestingOnce sync.Once
+
+// ConfigureLoggingForTestingT configures logrus to write to the logger of the
+// given testing.T.  It should be called at the start of each "go test" that
+// wants to capture log output.  It registers a cleanup with the testing.T to
+// remove the log redirection at the end of the test.
+func ConfigureLoggingForTestingT(t *testing.T) {
+	confForTestingOnce.Do(func() {
+		log.SetFormatter(&Formatter{Component: "test"})
+	})
+	t.Cleanup(RedirectLogrusToTestingT(t))
 }

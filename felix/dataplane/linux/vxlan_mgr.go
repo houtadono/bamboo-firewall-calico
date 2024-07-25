@@ -15,20 +15,25 @@
 package intdataplane
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net"
 	"reflect"
+	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 
 	"github.com/sirupsen/logrus"
-	log "github.com/sirupsen/logrus"
 	"github.com/vishvananda/netlink"
+	"golang.org/x/sys/unix"
 
-	"github.com/projectcalico/calico/felix/dataplane/common"
+	dpsets "github.com/projectcalico/calico/felix/dataplane/ipsets"
+	"github.com/projectcalico/calico/felix/dataplane/linux/dataplanedefs"
+	"github.com/projectcalico/calico/felix/environment"
 	"github.com/projectcalico/calico/felix/ethtool"
 	"github.com/projectcalico/calico/felix/ip"
 	"github.com/projectcalico/calico/felix/ipsets"
@@ -36,6 +41,8 @@ import (
 	"github.com/projectcalico/calico/felix/proto"
 	"github.com/projectcalico/calico/felix/routetable"
 	"github.com/projectcalico/calico/felix/rules"
+	"github.com/projectcalico/calico/felix/vxlanfdb"
+	"github.com/projectcalico/calico/libcalico-go/lib/set"
 )
 
 // added so that we can shim netlink for tests
@@ -52,13 +59,15 @@ type netlinkHandle interface {
 }
 
 type vxlanManager struct {
-	sync.Mutex
-
 	// Our dependencies.
-	hostname            string
-	routeTable          routeTable
-	blackholeRouteTable routeTable
-	noEncapRouteTable   routeTable
+	hostname                  string
+	routeTable                routetable.RouteTableInterface
+	blackholeRouteTable       routetable.RouteTableInterface
+	noEncapRouteTable         routetable.RouteTableInterface
+	parentIfaceName           string
+	lastParentDevUpdate       time.Time
+	previouslyUsedParentNames set.Set[string]
+	fdb                       VXLANFDB
 
 	// Hold pending updates.
 	routesByDest    map[string]*proto.RouteUpdate
@@ -66,7 +75,9 @@ type vxlanManager struct {
 	vtepsByNode     map[string]*proto.VXLANTunnelEndpointUpdate
 
 	// Holds this node's VTEP information.
-	myVTEP *proto.VXLANTunnelEndpointUpdate
+	myVTEPLock     sync.Mutex
+	myVTEPChangedC chan struct{}
+	myVTEP         *proto.VXLANTunnelEndpointUpdate
 
 	// VXLAN configuration.
 	vxlanDevice string
@@ -76,7 +87,7 @@ type vxlanManager struct {
 
 	// Indicates if configuration has changed since the last apply.
 	routesDirty       bool
-	ipsetsDataplane   common.IPSetsDataplane
+	ipsetsDataplane   dpsets.IPSetsDataplane
 	ipSetMetadata     ipsets.IPSetMetadata
 	externalNodeCIDRs []string
 	vtepsDirty        bool
@@ -84,88 +95,106 @@ type vxlanManager struct {
 	dpConfig          Config
 	noEncapProtocol   netlink.RouteProtocol
 	// Used so that we can shim the no encap route table for the tests
-	noEncapRTConstruct func(interfacePrefixes []string, ipVersion uint8, vxlan bool, netlinkTimeout time.Duration,
-		deviceRouteSourceAddress net.IP, deviceRouteProtocol netlink.RouteProtocol, removeExternalRoutes bool) routeTable
+	noEncapRTConstruct func(
+		interfacePrefixes []string, ipVersion uint8, netlinkTimeout time.Duration,
+		deviceRouteSourceAddress net.IP, deviceRouteProtocol netlink.RouteProtocol, removeExternalRoutes bool,
+	) routetable.RouteTableInterface
+
+	// Log context
+	logCtx *logrus.Entry
 }
 
-const (
-	defaultVXLANProto netlink.RouteProtocol = 80
-)
+type VXLANFDB interface {
+	SetVTEPs(vteps []vxlanfdb.VTEP)
+}
 
 func newVXLANManager(
-	ipsetsDataplane common.IPSetsDataplane,
-	rt routeTable,
+	ipsetsDataplane dpsets.IPSetsDataplane,
+	rt routetable.RouteTableInterface,
+	fdb VXLANFDB,
 	deviceName string,
 	dpConfig Config,
 	opRecorder logutils.OpRecorder,
 	ipVersion uint8,
+	featureDetector environment.FeatureDetectorIface,
 ) *vxlanManager {
-	nlHandle, _ := netlink.NewHandle()
+	nlHandle, _ := netlink.NewHandle(syscall.NETLINK_ROUTE)
 
-	blackHoleProto := defaultVXLANProto
+	blackHoleProto := dataplanedefs.VXLANDefaultProto
 	if dpConfig.DeviceRouteProtocol != syscall.RTPROT_BOOT {
 		blackHoleProto = dpConfig.DeviceRouteProtocol
 	}
 
-	brt := routetable.New(
-		[]string{routetable.InterfaceNone},
-		4,
-		false,
-		dpConfig.NetlinkTimeout,
-		dpConfig.DeviceRouteSourceAddress,
-		blackHoleProto,
-		false,
-		0,
-		opRecorder,
-	)
-
-	if ipVersion == 6 {
-		brt = routetable.New(
-			[]string{routetable.InterfaceNone},
-			ipVersion,
-			false,
-			dpConfig.NetlinkTimeout,
-			dpConfig.DeviceRouteSourceAddressIPv6,
-			blackHoleProto,
-			false,
-			0,
-			opRecorder,
-		)
-	} else if ipVersion != 4 {
-		log.WithField("ipVersion", ipVersion).Panic("Unknown IP version")
+	var brt routetable.RouteTableInterface
+	if !dpConfig.RouteSyncDisabled {
+		logrus.Debug("RouteSyncDisabled is false.")
+		if ipVersion == 4 {
+			brt = routetable.New(
+				[]string{routetable.InterfaceNone},
+				4,
+				dpConfig.NetlinkTimeout,
+				dpConfig.DeviceRouteSourceAddress,
+				blackHoleProto,
+				false,
+				unix.RT_TABLE_MAIN,
+				opRecorder,
+				featureDetector,
+			)
+		} else if ipVersion == 6 {
+			brt = routetable.New(
+				[]string{routetable.InterfaceNone},
+				ipVersion,
+				dpConfig.NetlinkTimeout,
+				dpConfig.DeviceRouteSourceAddressIPv6,
+				blackHoleProto,
+				false,
+				unix.RT_TABLE_MAIN,
+				opRecorder,
+				featureDetector,
+			)
+		} else {
+			logrus.WithField("ipVersion", ipVersion).Panic("Unknown IP version")
+		}
+	} else {
+		logrus.Info("RouteSyncDisabled is true, using DummyTable.")
+		brt = &routetable.DummyTable{}
 	}
 
 	return newVXLANManagerWithShims(
 		ipsetsDataplane,
 		rt, brt,
+		fdb,
 		deviceName,
 		dpConfig,
 		nlHandle,
 		ipVersion,
-		func(interfaceRegexes []string, ipVersion uint8, vxlan bool, netlinkTimeout time.Duration,
-			deviceRouteSourceAddress net.IP, deviceRouteProtocol netlink.RouteProtocol, removeExternalRoutes bool) routeTable {
-			return routetable.New(interfaceRegexes, ipVersion, vxlan, netlinkTimeout,
-				deviceRouteSourceAddress, deviceRouteProtocol, removeExternalRoutes, 0,
-				opRecorder,
+		func(interfaceRegexes []string,
+			ipVersion uint8,
+			netlinkTimeout time.Duration,
+			deviceRouteSourceAddress net.IP,
+			deviceRouteProtocol netlink.RouteProtocol,
+			removeExternalRoutes bool,
+		) routetable.RouteTableInterface {
+			return routetable.New(interfaceRegexes, ipVersion, netlinkTimeout,
+				deviceRouteSourceAddress, deviceRouteProtocol, removeExternalRoutes, unix.RT_TABLE_MAIN,
+				opRecorder, featureDetector,
 			)
 		},
 	)
 }
 
 func newVXLANManagerWithShims(
-	ipsetsDataplane common.IPSetsDataplane,
-	rt, brt routeTable,
+	ipsetsDataplane dpsets.IPSetsDataplane,
+	rt, brt routetable.RouteTableInterface,
+	fdb VXLANFDB,
 	deviceName string,
 	dpConfig Config,
 	nlHandle netlinkHandle,
 	ipVersion uint8,
-	noEncapRTConstruct func(interfacePrefixes []string, ipVersion uint8, vxlan bool, netlinkTimeout time.Duration,
-		deviceRouteSourceAddress net.IP, deviceRouteProtocol netlink.RouteProtocol, removeExternalRoutes bool) routeTable,
+	noEncapRTConstruct func(interfacePrefixes []string, ipVersion uint8, netlinkTimeout time.Duration,
+		deviceRouteSourceAddress net.IP, deviceRouteProtocol netlink.RouteProtocol, removeExternalRoutes bool) routetable.RouteTableInterface,
 ) *vxlanManager {
-	noEncapProtocol := defaultVXLANProto
-	if dpConfig.DeviceRouteProtocol != syscall.RTPROT_BOOT {
-		noEncapProtocol = dpConfig.DeviceRouteProtocol
-	}
+	logCtx := logrus.WithField("ipVersion", ipVersion)
 	return &vxlanManager{
 		ipsetsDataplane: ipsetsDataplane,
 		ipSetMetadata: ipsets.IPSetMetadata{
@@ -173,24 +202,44 @@ func newVXLANManagerWithShims(
 			SetID:   rules.IPSetIDAllVXLANSourceNets,
 			Type:    ipsets.IPSetTypeHashNet,
 		},
-		hostname:            dpConfig.Hostname,
-		routeTable:          rt,
-		blackholeRouteTable: brt,
-		routesByDest:        map[string]*proto.RouteUpdate{},
-		localIPAMBlocks:     map[string]*proto.RouteUpdate{},
-		vtepsByNode:         map[string]*proto.VXLANTunnelEndpointUpdate{},
-		vxlanDevice:         deviceName,
-		vxlanID:             dpConfig.RulesConfig.VXLANVNI,
-		vxlanPort:           dpConfig.RulesConfig.VXLANPort,
-		ipVersion:           ipVersion,
-		externalNodeCIDRs:   dpConfig.ExternalNodesCidrs,
-		routesDirty:         true,
-		vtepsDirty:          true,
-		dpConfig:            dpConfig,
-		nlHandle:            nlHandle,
-		noEncapProtocol:     noEncapProtocol,
-		noEncapRTConstruct:  noEncapRTConstruct,
+		hostname:                  dpConfig.Hostname,
+		routeTable:                rt,
+		blackholeRouteTable:       brt,
+		previouslyUsedParentNames: set.New[string](),
+		fdb:                       fdb,
+		routesByDest:              map[string]*proto.RouteUpdate{},
+		localIPAMBlocks:           map[string]*proto.RouteUpdate{},
+		vtepsByNode:               map[string]*proto.VXLANTunnelEndpointUpdate{},
+		myVTEPChangedC:            make(chan struct{}, 1),
+		vxlanDevice:               deviceName,
+		vxlanID:                   dpConfig.RulesConfig.VXLANVNI,
+		vxlanPort:                 dpConfig.RulesConfig.VXLANPort,
+		ipVersion:                 ipVersion,
+		externalNodeCIDRs:         dpConfig.ExternalNodesCidrs,
+		routesDirty:               true,
+		vtepsDirty:                true,
+		dpConfig:                  dpConfig,
+		nlHandle:                  nlHandle,
+		noEncapProtocol:           calculateNonEncapRouteProtocol(dpConfig),
+		noEncapRTConstruct:        noEncapRTConstruct,
+		logCtx:                    logCtx,
 	}
+}
+
+func calculateNonEncapRouteProtocol(dpConfig Config) netlink.RouteProtocol {
+	// For same-subnet and blackhole routes, we need a unique protocol
+	// to attach to the routes.  If the global DeviceRouteProtocol is set to
+	// a usable value, use that; otherwise, pick a safer default.  (For back
+	// compatibility, our DeviceRouteProtocol defaults to RTPROT_BOOT, which
+	// can also be used by other processes.)
+	//
+	// Routes to the VXLAN tunnel device itself are identified by their target
+	// interface.  We don't need to worry about their protocol.
+	noEncapProtocol := dataplanedefs.VXLANDefaultProto
+	if dpConfig.DeviceRouteProtocol != syscall.RTPROT_BOOT {
+		noEncapProtocol = dpConfig.DeviceRouteProtocol
+	}
+	return noEncapProtocol
 }
 
 func (m *vxlanManager) OnUpdate(protoBufMsg interface{}) {
@@ -199,7 +248,7 @@ func (m *vxlanManager) OnUpdate(protoBufMsg interface{}) {
 		// Check to make sure that we are dealing with messages of the correct IP version.
 		cidr, err := ip.CIDRFromString(msg.Dst)
 		if err != nil {
-			log.WithError(err).WithField("msg", msg).Warning("Unable to parse route update destination. Skipping update.")
+			m.logCtx.WithError(err).WithField("msg", msg).Warning("Unable to parse route update destination. Skipping update.")
 			return
 		}
 		if m.ipVersion != cidr.Version() {
@@ -210,19 +259,20 @@ func (m *vxlanManager) OnUpdate(protoBufMsg interface{}) {
 		// In case the route changes type to one we no longer care about...
 		m.deleteRoute(msg.Dst)
 
+		// Process remote IPAM blocks.
 		if msg.Type == proto.RouteType_REMOTE_WORKLOAD && msg.IpPoolType == proto.IPPoolType_VXLAN {
-			logrus.WithField("msg", msg).Debug("VXLAN data plane received route update")
+			m.logCtx.WithField("msg", msg).Debug("VXLAN data plane received route update")
 			m.routesByDest[msg.Dst] = msg
 			m.routesDirty = true
 		}
 
 		// Process IPAM blocks that aren't associated to a single or /32 local workload
 		if routeIsLocalVXLANBlock(msg) {
-			logrus.WithField("msg", msg).Debug("VXLAN data plane received route update for IPAM block")
+			m.logCtx.WithField("msg", msg).Debug("VXLAN data plane received route update for IPAM block")
 			m.localIPAMBlocks[msg.Dst] = msg
 			m.routesDirty = true
 		} else if _, ok := m.localIPAMBlocks[msg.Dst]; ok {
-			logrus.WithField("msg", msg).Debug("VXLAN data plane IPAM block changed to something else")
+			m.logCtx.WithField("msg", msg).Debug("VXLAN data plane IPAM block changed to something else")
 			delete(m.localIPAMBlocks, msg.Dst)
 			m.routesDirty = true
 		}
@@ -231,7 +281,7 @@ func (m *vxlanManager) OnUpdate(protoBufMsg interface{}) {
 		// Check to make sure that we are dealing with messages of the correct IP version.
 		cidr, err := ip.CIDRFromString(msg.Dst)
 		if err != nil {
-			log.WithError(err).WithField("msg", msg).Warning("Unable to parse route removal destination. Skipping update.")
+			m.logCtx.WithError(err).WithField("msg", msg).Warning("Unable to parse route removal destination. Skipping update.")
 			return
 		}
 		if m.ipVersion != cidr.Version() {
@@ -243,10 +293,11 @@ func (m *vxlanManager) OnUpdate(protoBufMsg interface{}) {
 		// Check to make sure that we are dealing with messages of the correct IP version.
 		if (m.ipVersion == 4 && msg.Ipv4Addr == "") || (m.ipVersion == 6 && msg.Ipv6Addr == "") {
 			// Skip since the update is for a mismatched IP version
+			m.logCtx.WithField("msg", msg).Debug("Skipping mismatched IP version update")
 			return
 		}
 
-		logrus.WithField("msg", msg).Debug("VXLAN data plane received VTEP update")
+		m.logCtx.WithField("msg", msg).Debug("VXLAN data plane received VTEP update")
 		if msg.Node == m.hostname {
 			m.setLocalVTEP(msg)
 		} else {
@@ -255,7 +306,7 @@ func (m *vxlanManager) OnUpdate(protoBufMsg interface{}) {
 		m.routesDirty = true
 		m.vtepsDirty = true
 	case *proto.VXLANTunnelEndpointRemove:
-		logrus.WithField("msg", msg).Debug("VXLAN data plane received VTEP remove")
+		m.logCtx.WithField("msg", msg).Debug("VXLAN data plane received VTEP remove")
 		if msg.Node == m.hostname {
 			m.setLocalVTEP(nil)
 		} else {
@@ -284,7 +335,7 @@ func routeIsLocalVXLANBlock(msg *proto.RouteUpdate) bool {
 	// Check the valid suffix depending on IP version.
 	cidr, err := ip.CIDRFromString(msg.Dst)
 	if err != nil {
-		log.WithError(err).WithField("msg", msg).Warning("Unable to parse destination into a CIDR. Treating block as external.")
+		logrus.WithError(err).WithField("msg", msg).Warning("Unable to parse destination into a CIDR. Treating block as external.")
 	}
 	if cidr.Version() == 4 {
 		// This is an IPv4 route.
@@ -327,14 +378,18 @@ func (m *vxlanManager) deleteRoute(dst string) {
 }
 
 func (m *vxlanManager) setLocalVTEP(vtep *proto.VXLANTunnelEndpointUpdate) {
-	m.Lock()
-	defer m.Unlock()
+	m.myVTEPLock.Lock()
+	defer m.myVTEPLock.Unlock()
 	m.myVTEP = vtep
+	select {
+	case m.myVTEPChangedC <- struct{}{}:
+	default:
+	}
 }
 
 func (m *vxlanManager) getLocalVTEP() *proto.VXLANTunnelEndpointUpdate {
-	m.Lock()
-	defer m.Unlock()
+	m.myVTEPLock.Lock()
+	defer m.myVTEPLock.Unlock()
 	return m.myVTEP
 }
 
@@ -342,26 +397,16 @@ func (m *vxlanManager) getLocalVTEPParent() (netlink.Link, error) {
 	return m.getParentInterface(m.getLocalVTEP())
 }
 
-func (m *vxlanManager) getNoEncapRouteTable() routeTable {
-	m.Lock()
-	defer m.Unlock()
+func (m *vxlanManager) GetRouteTableSyncers() []routetable.RouteTableSyncer {
+	rts := []routetable.RouteTableSyncer{m.routeTable, m.blackholeRouteTable}
 
-	return m.noEncapRouteTable
-}
-
-func (m *vxlanManager) setNoEncapRouteTable(rt routeTable) {
-	m.Lock()
-	defer m.Unlock()
-
-	m.noEncapRouteTable = rt
-}
-
-func (m *vxlanManager) GetRouteTableSyncers() []routeTableSyncer {
-	rts := []routeTableSyncer{m.routeTable, m.blackholeRouteTable}
-
-	noEncapRouteTable := m.getNoEncapRouteTable()
-	if noEncapRouteTable != nil {
-		rts = append(rts, noEncapRouteTable)
+	if time.Since(m.lastParentDevUpdate) > 5*time.Minute && m.previouslyUsedParentNames.Len() > 1 {
+		// Make sure the set of names doesn't grow forever.
+		m.previouslyUsedParentNames.Clear()
+	}
+	if m.noEncapRouteTable != nil {
+		m.previouslyUsedParentNames.Add(m.parentIfaceName)
+		rts = append(rts, m.noEncapRouteTable)
 	}
 
 	return rts
@@ -372,7 +417,7 @@ func (m *vxlanManager) blackholeRoutes() []routetable.Target {
 	for dst := range m.localIPAMBlocks {
 		cidr, err := ip.CIDRFromString(dst)
 		if err != nil {
-			logrus.WithError(err).Warning(
+			m.logCtx.WithError(err).Warning(
 				"Error processing IPAM block CIDR: ", dst,
 			)
 			continue
@@ -382,183 +427,256 @@ func (m *vxlanManager) blackholeRoutes() []routetable.Target {
 			CIDR: cidr,
 		})
 	}
-	logrus.Debug("calculated blackholes ", rtt)
+	m.logCtx.Debug("calculated blackholes ", rtt)
 	return rtt
 }
 
 func (m *vxlanManager) CompleteDeferredWork() error {
-	if !m.routesDirty {
-		logrus.Debug("No change since last application, nothing to do")
-		return nil
-	}
-
 	if m.vtepsDirty {
-		var allowedVXLANSources []string
-		if m.vtepsDirty {
-			logrus.Debug("VTEPs are dirty, collecting the allowed VXLAN source set")
-			allowedVXLANSources = append(allowedVXLANSources, m.externalNodeCIDRs...)
-		}
-
-		// The route table accepts the desired state. Start by setting the desired L2 "routes" by iterating
-		// known VTEPs.
-		var l2routes []routetable.L2Target
-		for _, u := range m.vtepsByNode {
-			mac, err := net.ParseMAC(u.Mac)
-			if err != nil {
-				// Don't block programming of other VTEPs if somehow we receive one with a bad mac.
-				logrus.WithError(err).Warn("Failed to parse VTEP mac address")
-				continue
-			}
-			addr := u.Ipv4Addr
-			parentDeviceIP := u.ParentDeviceIp
-			if m.ipVersion == 6 {
-				addr = u.Ipv6Addr
-				parentDeviceIP = u.ParentDeviceIpv6
-			}
-			l2routes = append(l2routes, routetable.L2Target{
-				VTEPMAC: mac,
-				GW:      ip.FromString(addr),
-				IP:      ip.FromString(parentDeviceIP),
-			})
-			allowedVXLANSources = append(allowedVXLANSources, parentDeviceIP)
-		}
-		logrus.WithField("l2routes", l2routes).Debug("VXLAN manager sending L2 updates")
-		m.routeTable.SetL2Routes(m.vxlanDevice, l2routes)
-		m.ipsetsDataplane.AddOrReplaceIPSet(m.ipSetMetadata, allowedVXLANSources)
+		m.updateNeighborsAndAllowedSources()
 		m.vtepsDirty = false
 	}
 
 	if m.routesDirty {
-		// Iterate through all of our L3 routes and send them through to the route table.
-		var vxlanRoutes []routetable.Target
-		var noEncapRoutes []routetable.Target
-		for _, r := range m.routesByDest {
-			logCtx := logrus.WithField("route", r)
-			cidr, err := ip.CIDRFromString(r.Dst)
-			if err != nil {
-				// Don't block programming of other routes if somehow we receive one with a bad dst.
-				logCtx.WithError(err).Warn("Failed to parse VXLAN route destination")
-				continue
-			}
-
-			if r.GetSameSubnet() {
-				if r.DstNodeIp == "" {
-					logCtx.Debug("Can't program non-encap route since host IP is not known.")
-					continue
-				}
-
-				defaultRoute := routetable.Target{
-					Type: routetable.TargetTypeNoEncap,
-					CIDR: cidr,
-					GW:   ip.FromString(r.DstNodeIp),
-				}
-
-				noEncapRoutes = append(noEncapRoutes, defaultRoute)
-				logCtx.WithField("route", r).Debug("adding no encap route to list for addition")
-			} else {
-				// Extract the gateway addr for this route based on its remote VTEP.
-				vtep, ok := m.vtepsByNode[r.DstNodeName]
-				if !ok {
-					// When the VTEP arrives, it'll set routesDirty=true so this loop will execute again.
-					logCtx.Debug("Dataplane has route with no corresponding VTEP")
-					continue
-				}
-
-				vtepAddr := vtep.Ipv4Addr
-				if m.ipVersion == 6 {
-					vtepAddr = vtep.Ipv6Addr
-				}
-				vxlanRoute := routetable.Target{
-					Type: routetable.TargetTypeVXLAN,
-					CIDR: cidr,
-					GW:   ip.FromString(vtepAddr),
-				}
-
-				vxlanRoutes = append(vxlanRoutes, vxlanRoute)
-				logCtx.WithField("route", vxlanRoute).Debug("adding vxlan route to list for addition")
-			}
+		err := m.updateRoutes()
+		if err != nil {
+			return err
 		}
-
-		logrus.WithField("vxlanroutes", vxlanRoutes).Debug("VXLAN manager sending VXLAN L3 updates")
-		m.routeTable.SetRoutes(m.vxlanDevice, vxlanRoutes)
-
-		m.blackholeRouteTable.SetRoutes(routetable.InterfaceNone, m.blackholeRoutes())
-
-		noEncapRouteTable := m.getNoEncapRouteTable()
-		// only set the noEncapRouteTable table if it's nil, as you will lose the routes that are being managed already
-		// and the new table will probably delete routes that were put in there by the previous table
-		if noEncapRouteTable != nil {
-			if parentDevice, err := m.getLocalVTEPParent(); err == nil {
-				ifName := parentDevice.Attrs().Name
-				log.WithField("link", parentDevice).WithField("routes", noEncapRoutes).Debug("VXLAN manager sending unencapsulated L3 updates")
-				noEncapRouteTable.SetRoutes(ifName, noEncapRoutes)
-			} else {
-				return err
-			}
-		} else {
-			return errors.New("no encap route table not set, will defer adding routes")
-		}
-
-		logrus.Info("VXLAN Manager completed deferred work")
-
 		m.routesDirty = false
 	}
 
 	return nil
 }
 
+func (m *vxlanManager) updateNeighborsAndAllowedSources() {
+	m.logCtx.Debug("VTEPs are dirty, updating allowed VXLAN sources and L2 neighbors.")
+
+	// We allow VXLAN packets from configured external sources as well as
+	// each Calico node with a valid VTEP.
+	allowedVXLANSources := make([]string, 0, len(m.vtepsByNode)+len(m.externalNodeCIDRs))
+	allowedVXLANSources = append(allowedVXLANSources, m.externalNodeCIDRs...)
+
+	// Collect the L2 neighbors and the VTEPS.
+	var l2routes []vxlanfdb.VTEP
+	for _, u := range m.vtepsByNode {
+		mac, err := parseMacForIPVersion(u, m.ipVersion)
+		if err != nil {
+			// Don't block programming of other VTEPs if somehow we receive one with a bad mac.
+			m.logCtx.WithError(err).Warn("Failed to parse VTEP mac address")
+			continue
+		}
+		addr := u.Ipv4Addr
+		parentDeviceIP := u.ParentDeviceIp
+		if m.ipVersion == 6 {
+			addr = u.Ipv6Addr
+			parentDeviceIP = u.ParentDeviceIpv6
+		}
+		l2routes = append(l2routes, vxlanfdb.VTEP{
+			TunnelMAC: mac,
+			TunnelIP:  ip.FromIPOrCIDRString(addr),
+			HostIP:    ip.FromIPOrCIDRString(parentDeviceIP),
+		})
+		allowedVXLANSources = append(allowedVXLANSources, parentDeviceIP)
+	}
+	m.logCtx.WithField("l2routes", l2routes).Debug("VXLAN manager sending L2 updates")
+	m.fdb.SetVTEPs(l2routes)
+	m.ipsetsDataplane.AddOrReplaceIPSet(m.ipSetMetadata, allowedVXLANSources)
+}
+
+func (m *vxlanManager) updateRoutes() error {
+	// Iterate through all of our L3 routes and send them through to the route table.
+	var vxlanRoutes []routetable.Target
+	var noEncapRoutes []routetable.Target
+	for _, r := range m.routesByDest {
+		logCtx := m.logCtx.WithField("route", r)
+		cidr, err := ip.CIDRFromString(r.Dst)
+		if err != nil {
+			// Don't block programming of other routes if somehow we receive one with a bad dst.
+			logCtx.WithError(err).Warn("Failed to parse VXLAN route destination")
+			continue
+		}
+
+		if noEncapRoute := m.noEncapRoute(cidr, r); noEncapRoute != nil {
+			// We've got everything we need to program this route as a no-encap route.
+			noEncapRoutes = append(noEncapRoutes, *noEncapRoute)
+			logCtx.WithField("route", r).Debug("Destination in same subnet, using no-encap route.")
+		} else if vxlanRoute := m.tunneledRoute(cidr, r); vxlanRoute != nil {
+			vxlanRoutes = append(vxlanRoutes, *vxlanRoute)
+			logCtx.WithField("route", vxlanRoute).Debug("adding vxlan route to list for addition")
+		} else {
+			logCtx.Debug("Not enough information to program route; missing VTEP?")
+		}
+	}
+
+	m.logCtx.WithField("vxlanRoutes", vxlanRoutes).Debug("VXLAN manager setting VXLAN tunneled routes")
+	m.routeTable.SetRoutes(m.vxlanDevice, vxlanRoutes)
+	m.blackholeRouteTable.SetRoutes(routetable.InterfaceNone, m.blackholeRoutes())
+
+	if m.noEncapRouteTable != nil {
+		m.logCtx.WithField("link", m.parentIfaceName).WithField("routes", noEncapRoutes).Debug(
+			"VXLAN manager sending unencapsulated L3 updates")
+		m.noEncapRouteTable.SetRoutes(m.parentIfaceName, noEncapRoutes)
+	} else {
+		return errors.New("no encap route table not set, will defer adding routes")
+	}
+
+	m.logCtx.Info("VXLAN Manager completed deferred work")
+	return nil
+}
+
+func (m *vxlanManager) noEncapRoute(cidr ip.CIDR, r *proto.RouteUpdate) *routetable.Target {
+	if !r.GetSameSubnet() {
+		return nil
+	}
+	if r.DstNodeIp == "" {
+		return nil
+	}
+	noEncapRoute := routetable.Target{
+		Type: routetable.TargetTypeNoEncap,
+		CIDR: cidr,
+		GW:   ip.FromString(r.DstNodeIp),
+	}
+	return &noEncapRoute
+}
+
+func (m *vxlanManager) tunneledRoute(cidr ip.CIDR, r *proto.RouteUpdate) *routetable.Target {
+	// Extract the gateway addr for this route based on its remote VTEP.
+	vtep, ok := m.vtepsByNode[r.DstNodeName]
+	if !ok {
+		// When the VTEP arrives, it'll set routesDirty=true so this loop will execute again.
+		return nil
+	}
+
+	vtepAddr := vtep.Ipv4Addr
+	if m.ipVersion == 6 {
+		vtepAddr = vtep.Ipv6Addr
+	}
+	vxlanRoute := routetable.Target{
+		Type: routetable.TargetTypeVXLAN,
+		CIDR: cidr,
+		GW:   ip.FromString(vtepAddr),
+	}
+	return &vxlanRoute
+}
+
+func (m *vxlanManager) OnParentNameUpdate(name string) {
+	if name == "" {
+		m.logCtx.Warn("Empty parent interface name? Ignoring.")
+		return
+	}
+	m.logCtx.WithField("parent", name).Info("Parent interface updated, creating new routing table.")
+	devRouteSrcAddr := m.dpConfig.DeviceRouteSourceAddress
+	if m.ipVersion == 6 {
+		devRouteSrcAddr = m.dpConfig.DeviceRouteSourceAddressIPv6
+	}
+	m.parentIfaceName = name
+	m.lastParentDevUpdate = time.Now()
+
+	// If we're changing the name, we need to make sure the new RouteTable will
+	// clean up the routes on the old interface.  Add previously-used names to
+	// the regexp.
+	names := m.previouslyUsedParentNames.Slice()
+	if !m.previouslyUsedParentNames.Contains(m.parentIfaceName) {
+		names = append(names, m.parentIfaceName)
+	}
+	sort.Strings(names)
+	for i, name := range names {
+		names[i] = regexp.QuoteMeta(name)
+	}
+
+	m.noEncapRouteTable = m.noEncapRTConstruct(
+		[]string{"^" + strings.Join(names, "|") + "$"},
+		m.ipVersion,
+		m.dpConfig.NetlinkTimeout,
+		devRouteSrcAddr,
+		m.noEncapProtocol,
+		false,
+	)
+	m.routesDirty = true
+}
+
 // KeepVXLANDeviceInSync is a goroutine that configures the VXLAN tunnel device, then periodically
 // checks that it is still correctly configured.
-func (m *vxlanManager) KeepVXLANDeviceInSync(mtu int, xsumBroken bool, wait time.Duration) {
-	logrus.WithFields(logrus.Fields{
+func (m *vxlanManager) KeepVXLANDeviceInSync(
+	ctx context.Context,
+	mtu int,
+	xsumBroken bool,
+	wait time.Duration,
+	parentNameC chan string,
+) {
+	m.logCtx.WithFields(logrus.Fields{
 		"mtu":        mtu,
 		"xsumBroken": xsumBroken,
 		"wait":       wait,
 	}).Info("VXLAN tunnel device thread started.")
 	logNextSuccess := true
-	for {
+	parentName := ""
+
+	sleepMonitoringChans := func(maxDuration time.Duration) {
+		timer := time.NewTimer(maxDuration)
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			logrus.Debug("Sleep returning early: context finished.")
+		case <-m.myVTEPChangedC:
+			logrus.Debug("Sleep returning early: VTEP changed.")
+		}
+	}
+
+	for ctx.Err() == nil {
 		localVTEP := m.getLocalVTEP()
 		if localVTEP == nil {
-			logrus.Debug("Missing local VTEP information, retrying...")
-			time.Sleep(1 * time.Second)
+			m.logCtx.Debug("Missing local VTEP information, retrying...")
+			sleepMonitoringChans(10 * time.Second)
 			continue
 		}
 
-		if parent, err := m.getLocalVTEPParent(); err != nil {
-			logrus.WithError(err).Warn("Failed configure VXLAN tunnel device, retrying...")
-			time.Sleep(1 * time.Second)
+		parent, err := m.getLocalVTEPParent()
+		if err != nil {
+			m.logCtx.WithError(err).Warn("Failed to find VXLAN tunnel device parent, retrying...")
+			sleepMonitoringChans(1 * time.Second)
 			continue
-		} else {
-			if m.getNoEncapRouteTable() == nil {
-				devRouteSrcAddr := m.dpConfig.DeviceRouteSourceAddress
-				if m.ipVersion == 6 {
-					devRouteSrcAddr = m.dpConfig.DeviceRouteSourceAddressIPv6
-				}
-				noEncapRouteTable := m.noEncapRTConstruct([]string{"^" + parent.Attrs().Name + "$"}, m.ipVersion, false, m.dpConfig.NetlinkTimeout, devRouteSrcAddr,
-					m.noEncapProtocol, false)
-				m.setNoEncapRouteTable(noEncapRouteTable)
+		}
+
+		m.logCtx.WithField("localVTEP", localVTEP).Debug("Configuring VXLAN device")
+		err = m.configureVXLANDevice(mtu, localVTEP, xsumBroken)
+		if err != nil {
+			m.logCtx.WithError(err).Warn("Failed to configure VXLAN tunnel device, retrying...")
+			logNextSuccess = true
+			sleepMonitoringChans(1 * time.Second)
+			continue
+		}
+
+		newParentName := parent.Attrs().Name
+		if newParentName != parentName {
+			// Send a message back to the main loop to tell it to update the
+			// routing tables.
+			m.logCtx.Infof("VXLAN device parent changed from %q to %q", parentName, newParentName)
+			select {
+			case parentNameC <- newParentName:
+				parentName = newParentName
+			case <-m.myVTEPChangedC:
+				m.logCtx.Info("My VTEP changed; restarting configuration.")
+				continue
+			case <-ctx.Done():
+				continue
 			}
 		}
 
-		err := m.configureVXLANDevice(mtu, localVTEP, xsumBroken)
-		if err != nil {
-			logrus.WithError(err).Warn("Failed configure VXLAN tunnel device, retrying...")
-			logNextSuccess = true
-			time.Sleep(1 * time.Second)
-			continue
-		}
-
 		if logNextSuccess {
-			logrus.Info("VXLAN tunnel device configured")
+			m.logCtx.Info("VXLAN tunnel device configured")
 			logNextSuccess = false
 		}
-		time.Sleep(wait)
+		sleepMonitoringChans(wait)
 	}
+	m.logCtx.Info("KeepVXLANDeviceInSync exiting due to context.")
 }
 
 // getParentInterface returns the parent interface for the given local VTEP based on IP address. This link returned is nil
 // if, and only if, an error occurred
 func (m *vxlanManager) getParentInterface(localVTEP *proto.VXLANTunnelEndpointUpdate) (netlink.Link, error) {
+	m.logCtx.WithField("localVTEP", localVTEP).Debug("Getting parent interface")
 	links, err := m.nlHandle.LinkList()
 	if err != nil {
 		return nil, err
@@ -577,7 +695,7 @@ func (m *vxlanManager) getParentInterface(localVTEP *proto.VXLANTunnelEndpointUp
 		}
 		for _, addr := range addrs {
 			if addr.IPNet.IP.String() == parentDeviceIP {
-				logrus.Debugf("Found parent interface: %s", link)
+				m.logCtx.Debugf("Found parent interface: %+v", link)
 				return link, nil
 			}
 		}
@@ -587,13 +705,13 @@ func (m *vxlanManager) getParentInterface(localVTEP *proto.VXLANTunnelEndpointUp
 
 // configureVXLANDevice ensures the VXLAN tunnel device is up and configured correctly.
 func (m *vxlanManager) configureVXLANDevice(mtu int, localVTEP *proto.VXLANTunnelEndpointUpdate, xsumBroken bool) error {
-	logCxt := logrus.WithFields(logrus.Fields{"device": m.vxlanDevice})
-	logCxt.Debug("Configuring VXLAN tunnel device")
+	logCtx := m.logCtx.WithFields(logrus.Fields{"device": m.vxlanDevice})
+	logCtx.Debug("Configuring VXLAN tunnel device")
 	parent, err := m.getParentInterface(localVTEP)
 	if err != nil {
 		return err
 	}
-	mac, err := net.ParseMAC(localVTEP.Mac)
+	mac, err := parseMacForIPVersion(localVTEP, m.ipVersion)
 	if err != nil {
 		return err
 	}
@@ -603,11 +721,11 @@ func (m *vxlanManager) configureVXLANDevice(mtu int, localVTEP *proto.VXLANTunne
 		addr = localVTEP.Ipv6Addr
 		parentDeviceIP = localVTEP.ParentDeviceIpv6
 	}
+	la := netlink.NewLinkAttrs()
+	la.Name = m.vxlanDevice
+	la.HardwareAddr = mac
 	vxlan := &netlink.Vxlan{
-		LinkAttrs: netlink.LinkAttrs{
-			Name:         m.vxlanDevice,
-			HardwareAddr: mac,
-		},
+		LinkAttrs:    la,
 		VxlanId:      m.vxlanID,
 		Port:         m.vxlanPort,
 		VtepDevIndex: parent.Attrs().Index,
@@ -617,10 +735,10 @@ func (m *vxlanManager) configureVXLANDevice(mtu int, localVTEP *proto.VXLANTunne
 	// Try to get the device.
 	link, err := m.nlHandle.LinkByName(m.vxlanDevice)
 	if err != nil {
-		logrus.WithError(err).Info("Failed to get VXLAN tunnel device, assuming it isn't present")
+		m.logCtx.WithError(err).Info("Failed to get VXLAN tunnel device, assuming it isn't present")
 		if err := m.nlHandle.LinkAdd(vxlan); err == syscall.EEXIST {
 			// Device already exists - likely a race.
-			logrus.Debug("VXLAN device already exists, likely created by someone else.")
+			m.logCtx.Debug("VXLAN device already exists, likely created by someone else.")
 		} else if err != nil {
 			// Error other than "device exists" - return it.
 			return err
@@ -643,7 +761,7 @@ func (m *vxlanManager) configureVXLANDevice(mtu int, localVTEP *proto.VXLANTunne
 		}
 		if err = m.nlHandle.LinkAdd(vxlan); err != nil {
 			if err == syscall.EEXIST {
-				log.Warnf("Failed to create VXLAN device. Another device with this VNI may already exist")
+				logrus.Warnf("Failed to create VXLAN device. Another device with this VNI may already exist")
 			}
 			return fmt.Errorf("failed to create vxlan interface: %v", err)
 		}
@@ -657,11 +775,11 @@ func (m *vxlanManager) configureVXLANDevice(mtu int, localVTEP *proto.VXLANTunne
 	attrs := link.Attrs()
 	oldMTU := attrs.MTU
 	if oldMTU != mtu {
-		logCxt.WithFields(logrus.Fields{"old": oldMTU, "new": mtu}).Info("VXLAN device MTU needs to be updated")
+		logCtx.WithFields(logrus.Fields{"old": oldMTU, "new": mtu}).Info("VXLAN device MTU needs to be updated")
 		if err := m.nlHandle.LinkSetMTU(link, mtu); err != nil {
-			log.WithError(err).Warn("Failed to set vxlan tunnel device MTU")
+			m.logCtx.WithError(err).Warn("Failed to set vxlan tunnel device MTU")
 		} else {
-			logCxt.Info("Updated vxlan tunnel MTU")
+			logCtx.Info("Updated vxlan tunnel MTU")
 		}
 	}
 
@@ -711,7 +829,10 @@ func (m *vxlanManager) ensureAddressOnLink(ipStr string, link netlink.Link) erro
 			addrPresent = true
 			continue
 		}
-		logrus.WithFields(logrus.Fields{"address": existing, "link": link.Attrs().Name}).Warn("Removing unwanted IP from VXLAN device")
+		m.logCtx.WithFields(logrus.Fields{
+			"address": existing,
+			"link":    link.Attrs().Name,
+		}).Warn("Removing unwanted IP from VXLAN device")
 		if err := m.nlHandle.AddrDel(link, &existing); err != nil {
 			return fmt.Errorf("failed to remove IP address %s", existing)
 		}
@@ -719,7 +840,7 @@ func (m *vxlanManager) ensureAddressOnLink(ipStr string, link netlink.Link) erro
 
 	// Actually add the desired address to the interface if needed.
 	if !addrPresent {
-		logrus.WithFields(logrus.Fields{"address": addr}).Info("Assigning address to VXLAN device")
+		m.logCtx.WithFields(logrus.Fields{"address": addr}).Info("Assigning address to VXLAN device")
 		if err := m.nlHandle.AddrAdd(link, &addr); err != nil {
 			return fmt.Errorf("failed to add IP address")
 		}
@@ -728,7 +849,7 @@ func (m *vxlanManager) ensureAddressOnLink(ipStr string, link netlink.Link) erro
 }
 
 // vlanLinksIncompat takes two vxlan devices and compares them to make sure they match. If they do not match,
-// this function will return a mesasge indicating which configuration is mismatched.
+// this function will return a message indicating which configuration is mismatched.
 func vxlanLinksIncompat(l1, l2 netlink.Link) string {
 	if l1.Type() != l2.Type() {
 		return fmt.Sprintf("link type: %v vs %v", l1.Type(), l2.Type())
@@ -766,4 +887,15 @@ func vxlanLinksIncompat(l1, l2 netlink.Link) string {
 	}
 
 	return ""
+}
+
+func parseMacForIPVersion(vtep *proto.VXLANTunnelEndpointUpdate, ipVersion uint8) (net.HardwareAddr, error) {
+	switch ipVersion {
+	case 4:
+		return net.ParseMAC(vtep.Mac)
+	case 6:
+		return net.ParseMAC(vtep.MacV6)
+	default:
+		return nil, fmt.Errorf("Invalid IP version")
+	}
 }

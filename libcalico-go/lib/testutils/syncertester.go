@@ -1,16 +1,17 @@
-// Copyright (c) 2017-2021 Tigera, Inc. All rights reserved.
+// Copyright (c) 2017-2024 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
+//	http://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+
 package testutils
 
 import (
@@ -27,6 +28,7 @@ import (
 
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
+
 	log "github.com/sirupsen/logrus"
 
 	gomegatypes "github.com/onsi/gomega/types"
@@ -46,9 +48,7 @@ func NewSyncerTester() *SyncerTester {
 	}
 }
 
-var (
-	UnsetSyncStatus = api.SyncStatus(255)
-)
+var UnsetSyncStatus = api.SyncStatus(255)
 
 // Encapsulates parse error details for easy handling with a single channel.
 type parseError struct {
@@ -101,7 +101,6 @@ func (st *SyncerTester) OnStatusUpdated(status api.SyncStatus) {
 	// to unblock the processing.
 	st.statusBlocker.Wait()
 	log.Infof("OnStatusUpdated now unblocked waiting for: %s", status)
-
 }
 
 // OnUpdates just stores the update and asserts the state of the cache and the update.
@@ -437,7 +436,7 @@ func (st *SyncerTester) ExpectUpdates(expectedUpdates []api.Update, checkOrder b
 // This removes all updates/onUpdate events from this receiver, so that the next call to this just requires the next set
 // of updates.
 //
-// Note that for this function to be useful, your test code needs to have fine grained control over the order in which
+// Note that for this function to be useful, your test code needs to have fine-grained control over the order in which
 // events occur.
 func (st *SyncerTester) ExpectOnUpdates(expected [][]api.Update) {
 	log.Infof("Expecting OnUpdates of %v", expected)
@@ -549,7 +548,7 @@ func updatesEqual(actual, expected api.Update) bool {
 // update - this makes writing tests simpler.
 func kvpsEqual(actual, expected model.KVPair) bool {
 	if !reflect.DeepEqual(expected.Key, actual.Key) {
-		log.Debug("Keys are not equal: %#v != %#v", expected.Key, actual.Key)
+		log.Debugf("Keys are not equal: %#v != %#v", expected.Key, actual.Key)
 		return false
 	}
 	if expected.UID != nil && (actual.UID == nil || *actual.UID != *expected.UID) {
@@ -634,7 +633,6 @@ func kvpsEqual(actual, expected model.KVPair) bool {
 		expectedCopy.GetObjectMeta().SetDeletionGracePeriodSeconds(actualCopy.GetObjectMeta().GetDeletionGracePeriodSeconds())
 		expectedCopy.GetObjectMeta().SetFinalizers(actualCopy.GetObjectMeta().GetFinalizers())
 		expectedCopy.GetObjectMeta().SetOwnerReferences(actualCopy.GetObjectMeta().GetOwnerReferences())
-		expectedCopy.GetObjectMeta().SetClusterName(actualCopy.GetObjectMeta().GetClusterName())
 		expectedCopy.GetObjectMeta().SetManagedFields(actualCopy.GetObjectMeta().GetManagedFields())
 
 		// Finally compare the structs.

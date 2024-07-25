@@ -32,6 +32,8 @@ import (
 	"github.com/projectcalico/calico/felix/fv/infrastructure"
 	"github.com/projectcalico/calico/felix/fv/utils"
 	"github.com/projectcalico/calico/felix/fv/workload"
+	"github.com/projectcalico/calico/felix/iptables"
+	"github.com/projectcalico/calico/felix/nftables"
 	"github.com/projectcalico/calico/felix/rules"
 	"github.com/projectcalico/calico/libcalico-go/lib/apiconfig"
 	client "github.com/projectcalico/calico/libcalico-go/lib/clientv3"
@@ -39,11 +41,10 @@ import (
 )
 
 var _ = infrastructure.DatastoreDescribe("_BPF-SAFE_ apply on forward tests; with 2 nodes", []apiconfig.DatastoreType{apiconfig.EtcdV3, apiconfig.Kubernetes}, func(getInfra infrastructure.InfraFactory) {
-
 	var (
 		bpfEnabled = os.Getenv("FELIX_FV_ENABLE_BPF") == "true"
 		infra      infrastructure.DatastoreInfra
-		felixes    []*infrastructure.Felix
+		tc         infrastructure.TopologyContainers
 		client     client.Interface
 		w          [2]*workload.Workload
 		hostW      [2]*workload.Workload
@@ -55,7 +56,7 @@ var _ = infrastructure.DatastoreDescribe("_BPF-SAFE_ apply on forward tests; wit
 
 		options := infrastructure.DefaultTopologyOptions()
 		options.IPIPEnabled = false
-		felixes, client = infrastructure.StartNNodeTopology(2, options, infra)
+		tc, client = infrastructure.StartNNodeTopology(2, options, infra)
 
 		// Install a default profile that allows all ingress and egress, in the absence of any Policy.
 		infra.AddDefaultAllow()
@@ -64,10 +65,10 @@ var _ = infrastructure.DatastoreDescribe("_BPF-SAFE_ apply on forward tests; wit
 		for ii := range w {
 			wIP := fmt.Sprintf("10.65.%d.2", ii)
 			wName := fmt.Sprintf("w%d", ii)
-			w[ii] = workload.Run(felixes[ii], wName, "default", wIP, "8055", "tcp")
+			w[ii] = workload.Run(tc.Felixes[ii], wName, "default", wIP, "8055", "tcp")
 			w[ii].ConfigureInInfra(infra)
 
-			hostW[ii] = workload.Run(felixes[ii], fmt.Sprintf("host%d", ii), "", felixes[ii].IP, "8055", "tcp")
+			hostW[ii] = workload.Run(tc.Felixes[ii], fmt.Sprintf("host%d", ii), "", tc.Felixes[ii].IP, "8055", "tcp")
 		}
 
 		cc = &connectivity.Checker{}
@@ -75,9 +76,13 @@ var _ = infrastructure.DatastoreDescribe("_BPF-SAFE_ apply on forward tests; wit
 
 	AfterEach(func() {
 		if CurrentGinkgoTestDescription().Failed {
-			for _, felix := range felixes {
-				felix.Exec("iptables-save", "-c")
-				felix.Exec("ipset", "list")
+			for _, felix := range tc.Felixes {
+				if NFTMode() {
+					logNFTDiags(felix)
+				} else {
+					felix.Exec("iptables-save", "-c")
+					felix.Exec("ipset", "list")
+				}
 				felix.Exec("ip", "r")
 				felix.Exec("ip", "a")
 			}
@@ -89,10 +94,8 @@ var _ = infrastructure.DatastoreDescribe("_BPF-SAFE_ apply on forward tests; wit
 		for _, wl := range hostW {
 			wl.Stop()
 		}
-		for _, felix := range felixes {
-			felix.Stop()
-		}
 
+		tc.Stop()
 		if CurrentGinkgoTestDescription().Failed {
 			infra.DumpErrorData()
 		}
@@ -149,7 +152,7 @@ var _ = infrastructure.DatastoreDescribe("_BPF-SAFE_ apply on forward tests; wit
 				ctx, cancel = context.WithTimeout(context.Background(), 30*time.Second)
 				defer cancel()
 
-				for _, f := range felixes {
+				for _, f := range tc.Felixes {
 					hep := api.NewHostEndpoint()
 					hep.Name = "eth0-" + f.Name
 					hep.Labels = map[string]string{
@@ -165,6 +168,10 @@ var _ = infrastructure.DatastoreDescribe("_BPF-SAFE_ apply on forward tests; wit
 					hostEndpointProgrammed := func() bool {
 						if bpfEnabled {
 							return f.NumTCBPFProgsEth0() == 2
+						} else if NFTMode() {
+							out, err := f.ExecOutput("nft", "list", "table", "calico")
+							Expect(err).NotTo(HaveOccurred())
+							return (strings.Count(out, "cali-thfw-eth0") > 0)
 						} else {
 							out, err := f.ExecOutput("iptables-save", "-t", "filter")
 							Expect(err).NotTo(HaveOccurred())
@@ -172,7 +179,7 @@ var _ = infrastructure.DatastoreDescribe("_BPF-SAFE_ apply on forward tests; wit
 						}
 					}
 					Eventually(hostEndpointProgrammed, "10s", "1s").Should(BeTrue(),
-						"Expected HostEndpoint iptables rules to appear")
+						"Expected HostEndpoint rules to appear")
 				}
 			})
 
@@ -186,7 +193,7 @@ var _ = infrastructure.DatastoreDescribe("_BPF-SAFE_ apply on forward tests; wit
 				ctx, cancel = context.WithTimeout(context.Background(), 30*time.Second)
 				defer cancel()
 
-				for _, f := range felixes {
+				for _, f := range tc.Felixes {
 					hep := api.NewHostEndpoint()
 					hep.Name = "all-interfaces-" + f.Name
 					hep.Labels = map[string]string{
@@ -203,15 +210,20 @@ var _ = infrastructure.DatastoreDescribe("_BPF-SAFE_ apply on forward tests; wit
 					hostEndpointProgrammed := func() bool {
 						if bpfEnabled {
 							return f.NumTCBPFProgsEth0() == 2
+						} else if NFTMode() {
+							out, err := f.ExecOutput("nft", "list", "table", "calico")
+							Expect(err).NotTo(HaveOccurred())
+							expectedName := rules.EndpointChainName("cali-thfw-", "any-interface-at-all", nftables.MaxChainNameLength)
+							return (strings.Count(out, expectedName) > 0)
 						} else {
 							out, err := f.ExecOutput("iptables-save", "-t", "filter")
 							Expect(err).NotTo(HaveOccurred())
-							expectedName := rules.EndpointChainName("cali-thfw-", "any-interface-at-all")
+							expectedName := rules.EndpointChainName("cali-thfw-", "any-interface-at-all", iptables.MaxChainNameLength)
 							return (strings.Count(out, expectedName) > 0)
 						}
 					}
 					Eventually(hostEndpointProgrammed, "10s", "1s").Should(BeTrue(),
-						"Expected HostEndpoint iptables rules to appear")
+						"Expected HostEndpoint rules to appear")
 				}
 			})
 
